@@ -1,0 +1,12299 @@
+# -*- coding: utf-8 -*-
+# pylint: disable=wrong-import-position, import-outside-toplevel, no-name-in-module
+"""Location: ./mcpgateway/main.py
+Copyright 2025
+SPDX-License-Identifier: Apache-2.0
+Authors: Mihai Criveti
+
+ContextForge AI Gateway - Main FastAPI Application.
+
+This module defines the core FastAPI application for the Model Context Protocol (MCP) Gateway.
+It serves as the entry point for handling all HTTP and WebSocket traffic.
+
+Features and Responsibilities:
+- Initializes and orchestrates services for tools, resources, prompts, servers, gateways, and roots.
+- Supports full MCP protocol operations: initialize, ping, notify, complete, and sample.
+- Integrates authentication (JWT and basic), CORS, caching, and middleware.
+- Serves a rich Admin UI for managing gateway entities via HTMX-based frontend.
+- Exposes routes for JSON-RPC, SSE, and WebSocket transports.
+- Manages application lifecycle including startup and graceful shutdown of all services.
+
+Structure:
+- Declares routers for MCP protocol operations and administration.
+- Registers dependencies (e.g., DB sessions, auth handlers).
+- Applies middleware including custom documentation protection.
+- Configures resource caching and session registry using pluggable backends.
+- Provides OpenAPI metadata and redirect handling depending on UI feature flags.
+"""
+
+# Standard
+import asyncio
+import base64
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
+from functools import lru_cache
+import hashlib
+import hmac
+import html
+import json
+import logging
+import re
+import signal
+import sys
+import threading
+from typing import Any, AsyncIterator, Dict, List, Optional, TypeAlias, Union
+from urllib.parse import urlparse, urlunparse
+import uuid
+import warnings
+
+# Third-Party
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Request, status, WebSocket, WebSocketDisconnect
+from fastapi.background import BackgroundTasks
+from fastapi.exception_handlers import request_validation_exception_handler as fastapi_default_validation_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from jinja2 import Environment, FileSystemLoader
+from jsonpath_ng.ext import parse
+from jsonpath_ng.jsonpath import JSONPath
+import orjson
+from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as starletteRequest
+from starlette.responses import Response as starletteResponse
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+# First-Party
+# Import the admin routes from the new module
+from mcpgateway import __version__
+from mcpgateway import version as version_module
+from mcpgateway.auth import _check_token_revoked_sync, _lookup_api_token_sync, get_current_user, get_user_team_roles, normalize_token_teams, resolve_session_teams
+from mcpgateway.cache import ResourceCache, SessionRegistry
+from mcpgateway.common.models import InitializeResult
+from mcpgateway.common.models import JSONRPCError as PydanticJSONRPCError
+from mcpgateway.common.models import ListResourceTemplatesResult, LogLevel, Root
+from mcpgateway.common.validators import SecurityValidator
+from mcpgateway.config import settings
+from mcpgateway.db import A2AAgent as DbA2AAgent
+from mcpgateway.db import A2APushNotificationConfig
+from mcpgateway.db import A2ATask as DbA2ATask
+from mcpgateway.db import refresh_slugs_on_startup, SessionLocal
+from mcpgateway.db import Tool as DbTool
+from mcpgateway.handlers.sampling import SamplingHandler
+from mcpgateway.middleware.compression import SSEAwareCompressMiddleware
+from mcpgateway.middleware.correlation_id import CorrelationIDMiddleware
+from mcpgateway.middleware.http_auth_middleware import HttpAuthMiddleware, run_pre_request_hooks
+from mcpgateway.middleware.protocol_version import MCPProtocolVersionMiddleware
+from mcpgateway.middleware.rbac import _ACCESS_DENIED_MSG, get_current_user_with_permissions, PermissionChecker, require_permission
+from mcpgateway.middleware.request_logging_middleware import RequestLoggingMiddleware
+from mcpgateway.middleware.security_headers import SecurityHeadersMiddleware
+from mcpgateway.middleware.token_scoping import token_scoping_middleware
+from mcpgateway.middleware.validation_middleware import ValidationMiddleware
+from mcpgateway.observability import init_telemetry, OpenTelemetryRequestMiddleware, otel_tracing_enabled
+from mcpgateway.plugins.framework import (
+    enable_plugins,
+    get_plugin_manager,
+    HttpHookType,
+    init_plugin_manager_factory,
+    PluginError,
+    PluginViolationError,
+    PromptHookType,
+    ResourceHookType,
+    shutdown_plugin_manager_factory,
+    start_plugin_invalidation_listener,
+    stop_plugin_invalidation_listener,
+)
+from mcpgateway.plugins.framework.constants import PLUGIN_VIOLATION_CODE_MAPPING, PluginViolationCode, VALID_HTTP_STATUS_CODES
+from mcpgateway.routers.server_well_known import router as server_well_known_router
+from mcpgateway.routers.well_known import router as well_known_router
+from mcpgateway.schemas import (
+    A2AAgentCreate,
+    A2AAgentRead,
+    A2AAgentUpdate,
+    A2APushNotificationConfigCreate,
+    CursorPaginatedA2AAgentsResponse,
+    CursorPaginatedGatewaysResponse,
+    CursorPaginatedPromptsResponse,
+    CursorPaginatedResourcesResponse,
+    CursorPaginatedServersResponse,
+    CursorPaginatedToolsResponse,
+    GatewayCreate,
+    GatewayRead,
+    GatewayRefreshResponse,
+    GatewayUpdate,
+    HealthCheckResponse,
+    HealthStatusItem,
+    JsonPathModifier,
+    MetricsResponse,
+    PromptCreate,
+    PromptExecuteArgs,
+    PromptRead,
+    PromptUpdate,
+    ResourceCreate,
+    ResourceRead,
+    ResourceSubscription,
+    ResourceUpdate,
+    RPCRequest,
+    ServerCreate,
+    ServerRead,
+    ServerUpdate,
+    TaggedEntity,
+    TagInfo,
+    ToolCreate,
+    ToolRead,
+    ToolUpdate,
+)
+from mcpgateway.services.a2a_server_service import A2AServerService
+from mcpgateway.services.a2a_service import A2AAgentError, A2AAgentNameConflictError, A2AAgentNotFoundError, A2AAgentService
+from mcpgateway.services.cancellation_service import cancellation_service
+from mcpgateway.services.completion_service import CompletionService
+from mcpgateway.services.content_security import ContentSizeError, ContentTypeError
+from mcpgateway.services.email_auth_service import EmailAuthService
+from mcpgateway.services.export_service import ExportError, ExportService
+from mcpgateway.services.gateway_service import GatewayConnectionError, GatewayDuplicateConflictError, GatewayError, GatewayNameConflictError, GatewayNotFoundError
+from mcpgateway.services.import_service import ConflictStrategy, ImportConflictError
+from mcpgateway.services.import_service import ImportError as ImportServiceError
+from mcpgateway.services.import_service import ImportService, ImportValidationError
+from mcpgateway.services.log_aggregator import get_log_aggregator
+from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.services.metrics import setup_metrics
+from mcpgateway.services.permission_service import PermissionService
+from mcpgateway.services.prompt_service import PromptError, PromptLockConflictError, PromptNameConflictError, PromptNotFoundError
+from mcpgateway.services.resource_service import ResourceError, ResourceLockConflictError, ResourceNotFoundError, ResourceURIConflictError
+from mcpgateway.services.server_service import ServerError, ServerLockConflictError, ServerNameConflictError, ServerNotFoundError
+from mcpgateway.services.tag_service import TagService
+from mcpgateway.services.tool_service import ToolError, ToolLockConflictError, ToolNameConflictError, ToolNotFoundError
+from mcpgateway.transports.sse_transport import SSETransport
+from mcpgateway.transports.streamablehttp_transport import (
+    _validate_streamable_session_access,
+    get_streamable_http_auth_context,
+    SessionManagerWrapper,
+    set_shared_session_registry,
+    streamable_http_auth,
+    user_context_var,
+)
+from mcpgateway.utils import uaid as uaid_utils
+from mcpgateway.utils.error_formatter import ErrorFormatter
+from mcpgateway.utils.internal_http import internal_loopback_base_url, internal_loopback_verify
+from mcpgateway.utils.metadata_capture import MetadataCapture
+from mcpgateway.utils.orjson_response import ORJSONResponse
+from mcpgateway.utils.passthrough_headers import set_global_passthrough_headers
+from mcpgateway.utils.paths import resolve_root_path
+from mcpgateway.utils.redis_client import close_redis_client, get_redis_client, is_redis_available
+from mcpgateway.utils.redis_isready import wait_for_redis_ready
+from mcpgateway.utils.retry_manager import ResilientHttpClient
+from mcpgateway.utils.token_scoping import validate_server_access
+from mcpgateway.utils.trace_context import clear_trace_context, set_trace_context_from_teams, set_trace_session_id
+from mcpgateway.utils.verify_credentials import extract_websocket_bearer_token, is_proxy_auth_trust_active, require_admin_auth, require_docs_auth_override, verify_jwt_token
+from mcpgateway.validation.jsonrpc import JSONRPCError
+from mcpgateway.version import router as version_router
+
+# Initialize logging service first
+logging_service = LoggingService()
+logger = logging_service.get_logger("mcpgateway")
+
+# Note: Logging configuration is handled by LoggingService during startup
+# Don't use basicConfig here as it conflicts with our dual logging setup
+# Note: DB readiness probing and bootstrap_db() are deferred to the lifespan
+# startup hook so that `import mcpgateway.main` does no I/O. See lifespan().
+
+# Enable plugin subsystem at module load time, mirroring the old singleton pattern.
+# get_plugin_manager() guards on this flag, so it must be set before lifespan runs.
+if settings.plugins.enabled:
+    enable_plugins(True)
+    logger.info("Plugin subsystem enabled (factory will be initialized in lifespan)")
+
+# First-Party
+# First-Party - import module-level service singletons
+from mcpgateway.services.gateway_service import gateway_service  # noqa: E402
+from mcpgateway.services.prompt_service import prompt_service  # noqa: E402
+from mcpgateway.services.resource_service import resource_service  # noqa: E402
+from mcpgateway.services.root_service import root_service, RootServiceNotFoundError  # noqa: E402
+from mcpgateway.services.server_service import server_service  # noqa: E402
+from mcpgateway.services.tool_service import tool_service  # noqa: E402
+
+# Services that do not expose module-level singletons are instantiated here
+completion_service = CompletionService()
+sampling_handler = SamplingHandler()
+tag_service = TagService()
+export_service = ExportService()
+import_service = ImportService()
+# Initialize A2A service only if A2A features are enabled
+a2a_service = A2AAgentService() if settings.mcpgateway_a2a_enabled else None
+
+# Initialize session manager for Streamable HTTP transport
+streamable_http_session = SessionManagerWrapper()
+
+# Wait for redis to be ready
+if settings.cache_type == "redis" and settings.redis_url is not None:
+    wait_for_redis_ready(redis_url=settings.redis_url, max_retries=int(settings.redis_max_retries), retry_interval_ms=int(settings.redis_retry_interval_ms), sync=True)
+
+# Initialize session registry
+session_registry = SessionRegistry(
+    backend=settings.cache_type,
+    redis_url=settings.redis_url if settings.cache_type == "redis" else None,
+    database_url=settings.database_url if settings.cache_type == "database" else None,
+    session_ttl=settings.session_ttl,
+    message_ttl=settings.message_ttl,
+)
+set_shared_session_registry(session_registry)
+
+
+# Helper function for authentication compatibility
+def get_user_email(user):
+    """Extract email from user object, handling both string and dict formats.
+
+    Args:
+        user: User object, can be either a dict (new RBAC format) or string (legacy format)
+
+    Returns:
+        str: User email address or 'unknown' if not available
+
+    Examples:
+        Test with dictionary user containing email:
+        >>> from mcpgateway import main
+        >>> user_dict = {'email': 'alice@example.com', 'role': 'admin'}
+        >>> main.get_user_email(user_dict)
+        'alice@example.com'
+
+        Test with dictionary user containing sub (JWT standard claim):
+        >>> user_dict_sub = {'sub': 'bob@example.com', 'role': 'user'}
+        >>> main.get_user_email(user_dict_sub)
+        'bob@example.com'
+
+        Test with dictionary user containing both email and sub (email takes precedence):
+        >>> user_dict_both = {'email': 'alice@example.com', 'sub': 'bob@example.com'}
+        >>> main.get_user_email(user_dict_both)
+        'alice@example.com'
+
+        Test with dictionary user without email or sub:
+        >>> user_dict_no_email = {'username': 'charlie', 'role': 'user'}
+        >>> main.get_user_email(user_dict_no_email)
+        'unknown'
+
+        Test with string user (legacy format):
+        >>> user_string = 'charlie@company.com'
+        >>> main.get_user_email(user_string)
+        'charlie@company.com'
+
+        Test with None user:
+        >>> main.get_user_email(None)
+        'unknown'
+
+        Test with empty dictionary:
+        >>> main.get_user_email({})
+        'unknown'
+
+        Test with integer (non-string, non-dict):
+        >>> main.get_user_email(123)
+        '123'
+
+        Test with user object having various data types:
+        >>> user_complex = {'email': 'david@test.org', 'id': 456, 'active': True}
+        >>> main.get_user_email(user_complex)
+        'david@test.org'
+
+        Test with empty string user:
+        >>> main.get_user_email('')
+        'unknown'
+
+        Test with boolean user:
+        >>> main.get_user_email(True)
+        'True'
+        >>> main.get_user_email(False)
+        'unknown'
+    """
+    if isinstance(user, dict):
+        # First try 'email', then 'sub' (JWT standard claim)
+        return user.get("email") or user.get("sub") or "unknown"
+    return str(user) if user else "unknown"
+
+
+_INTERNAL_MCP_AUTH_CONTEXT_HEADER = "x-contextforge-auth-context"
+_INTERNAL_MCP_RUNTIME_AUTH_HEADER = "x-contextforge-mcp-runtime-auth"
+_INTERNAL_MCP_RUNTIME_AUTH_CONTEXT = "contextforge-internal-mcp-runtime-v1"
+_INTERNAL_MCP_SESSION_VALIDATED_HEADER = "x-contextforge-session-validated"
+
+
+def _get_internal_mcp_auth_context(request: Request) -> Optional[Dict[str, Any]]:
+    """Return trusted auth context forwarded from the StreamableHTTP MCP auth layer.
+
+    Args:
+        request: Incoming request that may carry trusted MCP auth context on state.
+
+    Returns:
+        The forwarded auth context dictionary when present, otherwise ``None``.
+    """
+    internal_auth_context = getattr(request.state, "_mcp_internal_auth_context", None)
+    if isinstance(internal_auth_context, dict):
+        return internal_auth_context
+    return None
+
+
+def _decode_internal_mcp_auth_context(header_value: str) -> Dict[str, Any]:
+    """Decode the trusted internal MCP auth header payload.
+
+    Args:
+        header_value: Base64url-encoded trusted auth context header value.
+
+    Returns:
+        Decoded auth context dictionary.
+
+    Raises:
+        ValueError: If the decoded payload is not a JSON object.
+    """
+    padding = "=" * (-len(header_value) % 4)
+    decoded = base64.urlsafe_b64decode(f"{header_value}{padding}".encode("ascii"))
+    payload = orjson.loads(decoded)
+    if not isinstance(payload, dict):
+        raise ValueError("Decoded internal MCP auth context must be an object")
+    return payload
+
+
+def _auth_encryption_secret_value() -> str:
+    """Return the configured auth-encryption secret as a plain string.
+
+    Returns:
+        The auth-encryption secret, normalized to a regular string.
+    """
+    secret = settings.auth_encryption_secret
+    if hasattr(secret, "get_secret_value"):
+        return secret.get_secret_value()
+    return str(secret)
+
+
+@lru_cache(maxsize=8)
+def _expected_internal_mcp_runtime_auth_header_for_secret(secret: str) -> str:
+    """Return the shared secret-derived trust header for Rust->Python MCP hops.
+
+    Args:
+        secret: Auth-encryption secret to derive the trust header from.
+
+    Returns:
+        Hex-encoded SHA-256 digest derived from the provided auth secret.
+    """
+    material = f"{secret}:{_INTERNAL_MCP_RUNTIME_AUTH_CONTEXT}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _expected_internal_mcp_runtime_auth_header() -> str:
+    """Return the current shared secret-derived trust header for Rust->Python MCP hops.
+
+    Returns:
+        Hex-encoded SHA-256 digest derived from the current auth secret.
+    """
+    return _expected_internal_mcp_runtime_auth_header_for_secret(_auth_encryption_secret_value())
+
+
+def _has_valid_internal_mcp_runtime_auth_header(request: Request) -> bool:
+    """Validate the shared secret-derived trust header for internal MCP requests.
+
+    Args:
+        request: Incoming internal MCP request.
+
+    Returns:
+        ``True`` when the derived trust header matches the expected value.
+    """
+    provided = request.headers.get(_INTERNAL_MCP_RUNTIME_AUTH_HEADER)
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, _expected_internal_mcp_runtime_auth_header())
+
+
+def _is_trusted_internal_mcp_runtime_request(request: Request) -> bool:
+    """Return whether the request came from the local Rust runtime sidecar.
+
+    Args:
+        request: Incoming request to inspect.
+
+    Returns:
+        ``True`` when the request carries the trusted Rust runtime marker from
+        loopback, otherwise ``False``.
+    """
+    runtime_marker = request.headers.get("x-contextforge-mcp-runtime")
+    client_host = getattr(getattr(request, "client", None), "host", None)
+    if runtime_marker != "rust" or not _has_valid_internal_mcp_runtime_auth_header(request) or client_host not in ("127.0.0.1", "::1"):
+        return False
+    # Defense-in-depth: /_internal/a2a/* endpoints must refuse requests when
+    # A2A support is disabled, even from an otherwise-trusted local sidecar.
+    # A legitimate sidecar should not be running when the feature is off.
+    path = getattr(getattr(request, "url", None), "path", "") or ""
+    if path.startswith("/_internal/a2a/") and not settings.mcpgateway_a2a_enabled:
+        return False
+    return True
+
+
+def _build_internal_mcp_forwarded_user(request: Request) -> Dict[str, Any]:
+    """Build the authenticated user payload for internal Rust -> Python MCP dispatch.
+
+    Args:
+        request: Trusted internal request forwarded from the Rust runtime.
+
+    Returns:
+        Synthetic authenticated user payload used by internal MCP handlers.
+
+    Raises:
+        HTTPException: If the request is not trusted or the forwarded auth context
+            is missing or invalid.
+    """
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        raise HTTPException(status_code=403, detail="Internal MCP dispatch is only available to the local Rust runtime")
+
+    header_value = request.headers.get(_INTERNAL_MCP_AUTH_CONTEXT_HEADER)
+    if not header_value:
+        raise HTTPException(status_code=400, detail="Missing trusted MCP auth context")
+
+    try:
+        auth_context = _decode_internal_mcp_auth_context(header_value)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid trusted MCP auth context: {exc}") from exc
+
+    setattr(request.state, "_mcp_internal_auth_context", auth_context)
+
+    if "teams" in auth_context and (auth_context["teams"] is None or isinstance(auth_context["teams"], list)):
+        request.state.token_teams = auth_context["teams"]
+
+    if request.headers.get(_INTERNAL_MCP_SESSION_VALIDATED_HEADER) == "rust":
+        auth_context["_rust_session_validated"] = True
+
+    forwarded_auth_method = auth_context.get("auth_method") or "mcp_internal_forward"
+
+    set_trace_context_from_teams(
+        auth_context.get("teams"),
+        user_email=auth_context.get("email"),
+        is_admin=bool(auth_context.get("permission_is_admin", auth_context.get("is_admin", False))),
+        auth_method=forwarded_auth_method,
+        team_name=auth_context.get("team_name"),
+    )
+
+    return {
+        "email": auth_context.get("email"),
+        "full_name": auth_context.get("email") or "MCP Internal Forward",
+        "is_admin": bool(auth_context.get("permission_is_admin", auth_context.get("is_admin", False))),
+        "auth_method": forwarded_auth_method,
+        "token_use": auth_context.get("token_use"),
+    }
+
+
+def _enforce_internal_mcp_server_scope(request: Request, server_id: str) -> None:
+    """Validate trusted internal server scope against any forwarded token server scope.
+
+    Args:
+        request: Trusted internal MCP request.
+        server_id: Effective virtual server identifier for the operation.
+
+    Raises:
+        HTTPException: If the forwarded token scope does not authorize the server.
+    """
+    auth_context = _get_internal_mcp_auth_context(request)
+    if not isinstance(auth_context, dict):
+        return
+
+    scoped_server_id = auth_context.get("scoped_server_id")
+    if isinstance(scoped_server_id, str) and scoped_server_id and not validate_server_access({"server_id": scoped_server_id}, server_id):
+        raise HTTPException(status_code=403, detail=f"Token not authorized for server: {server_id}")
+
+
+async def _authorize_internal_mcp_request(request: Request, db: Session, *, permission: str, method: str, server_id: Optional[str] = None):
+    """Authorize trusted Rust-side MCP dispatch while preserving permissive MCP semantics.
+
+    For authenticated callers, this enforces the same token-scope and RBAC rules as
+    the regular RPC dispatcher. For unauthenticated MCP callers in permissive mode,
+    StreamableHTTP middleware already downgraded them to public-only scope and
+    enforced per-server OAuth, so the internal Rust -> Python hop should not re-deny
+    public-only requests merely because there is no authenticated RBAC identity.
+
+    Args:
+        request: Trusted internal MCP request.
+        db: Active database session.
+        permission: RBAC permission required for the method.
+        method: MCP method name being authorized.
+        server_id: Optional virtual server identifier used for additional scope checks.
+
+    Returns:
+        The forwarded user payload used for downstream authorization and scoping.
+    """
+    user = _build_internal_mcp_forwarded_user(request)
+    auth_context = _get_internal_mcp_auth_context(request) or {}
+
+    if server_id:
+        _enforce_internal_mcp_server_scope(request, server_id)
+
+    if auth_context.get("is_authenticated", True) is True:
+        await _ensure_rpc_permission(user, db, permission, method, request=request)
+
+    return user
+
+
+def _build_internal_mcp_auth_scope(
+    *,
+    method: str,
+    path: str,
+    query_string: str,
+    headers: Dict[str, str],
+    client_ip: Optional[str],
+) -> Dict[str, Any]:
+    """Construct a synthetic ASGI scope for internal Rust -> Python MCP auth.
+
+    Args:
+        method: HTTP method of the original public MCP request.
+        path: Public MCP path, for example ``/mcp`` or ``/servers/<id>/mcp``.
+        query_string: Raw query string without the leading ``?``.
+        headers: Public request headers to replay through auth/token scoping.
+        client_ip: Effective client IP derived by Rust from the public request.
+
+    Returns:
+        ASGI scope dictionary suitable for token scoping and ``streamable_http_auth``.
+    """
+    raw_headers = []
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        raw_headers.append((name.lower().encode("latin-1"), value.encode("latin-1")))
+
+    return {
+        "type": "http",
+        "method": method.upper(),
+        "path": path,
+        "raw_path": path.encode("latin-1"),
+        "query_string": query_string.encode("latin-1"),
+        "headers": raw_headers,
+        "client": (client_ip or "unknown", 0),
+        "state": {},
+    }
+
+
+async def _run_internal_mcp_authentication(
+    *,
+    method: str,
+    path: str,
+    query_string: str,
+    headers: Dict[str, str],
+    client_ip: Optional[str],
+) -> tuple[Optional[Response], Dict[str, Any]]:
+    """Run token scoping and MCP transport auth for a direct Rust ingress request.
+
+    Runs HTTP_PRE_REQUEST plugin hooks (e.g. WXO auth token exchange) before
+    authentication so the Rust MCP path gets identical plugin behavior to the
+    Python middleware chain.
+
+    Args:
+        method: HTTP method of the public request.
+        path: Public request path.
+        query_string: Raw query string without the leading ``?``.
+        headers: Public request headers replayed from Rust.
+        client_ip: Effective client IP for token-scope IP restriction checks.
+
+    Returns:
+        Tuple of ``(error_response, auth_context)``.
+        ``error_response`` is ``None`` on success; otherwise it contains the exact
+        response generated by the existing token-scoping/auth layers.
+    """
+    # Run pre-request plugin hooks (e.g. WXO JWT → team token exchange)
+    # before building the auth scope, so plugins can transform headers.
+    plugin_manager = await get_plugin_manager()
+    if plugin_manager and plugin_manager.has_hooks_for(HttpHookType.HTTP_PRE_REQUEST):
+        headers, _, _ = await run_pre_request_hooks(
+            plugin_manager=plugin_manager,
+            headers=headers,
+            path=path,
+            method=method,
+            client_host=client_ip,
+        )
+
+    scope = _build_internal_mcp_auth_scope(
+        method=method,
+        path=path,
+        query_string=query_string,
+        headers=headers,
+        client_ip=client_ip,
+    )
+    request = starletteRequest(scope)
+    sent_messages: list[dict[str, Any]] = []
+
+    async def _receive() -> dict[str, Any]:
+        """Return an empty request body for the synthetic auth probe.
+
+        Returns:
+            Minimal ASGI ``http.request`` message with no body content.
+        """
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def _send(message: dict[str, Any]) -> None:
+        """Capture ASGI response messages emitted by auth middleware.
+
+        Args:
+            message: ASGI response message emitted by the auth stack.
+        """
+        sent_messages.append(message)
+
+    def _captured_response() -> Response:
+        """Build a concrete response from the captured ASGI messages.
+
+        Returns:
+            Response reconstructed from the captured auth middleware output.
+        """
+        status_code = 500
+        response_headers: Dict[str, str] = {}
+        body = b""
+        for message in sent_messages:
+            if message.get("type") == "http.response.start":
+                status_code = int(message.get("status", 500))
+                response_headers = {
+                    key.decode("latin-1"): value.decode("latin-1") for key, value in message.get("headers", []) if isinstance(key, (bytes, bytearray)) and isinstance(value, (bytes, bytearray))
+                }
+            elif message.get("type") == "http.response.body":
+                body += message.get("body", b"")
+        return Response(content=body, status_code=status_code, headers=response_headers)
+
+    async def _call_next(_request: starletteRequest) -> Response:
+        """Run the existing Streamable HTTP auth layer for the synthetic request.
+
+        Returns:
+            Success response when authentication passes, otherwise the captured
+            failure response emitted by the existing middleware chain.
+        """
+        auth_ok = await streamable_http_auth(scope, _receive, _send)
+        if auth_ok:
+            return ORJSONResponse(status_code=200, content={"authenticated": True})
+        return _captured_response()
+
+    original_context = user_context_var.get()
+    user_context_var.set({})
+    try:
+        if settings.email_auth_enabled:
+            response = await token_scoping_middleware(request, _call_next)
+        else:
+            response = await _call_next(request)
+
+        if response is None:
+            response = _captured_response()
+
+        if response.status_code >= 400:
+            return response, {}
+
+        return None, get_streamable_http_auth_context()
+    finally:
+        user_context_var.set(original_context)
+
+
+def _normalize_token_teams(teams: Optional[List]) -> List[str]:
+    """
+    Normalize token teams to list of team IDs.
+
+    SSO tokens may contain team dicts like {"id": "...", "name": "..."}.
+    This normalizes to just IDs for consistent filtering.
+
+    Args:
+        teams: Raw teams from token payload (may be None, list of IDs, or list of dicts)
+
+    Returns:
+        List of team ID strings (empty list if None)
+
+    Examples:
+        >>> from mcpgateway import main
+        >>> main._normalize_token_teams(None)
+        []
+        >>> main._normalize_token_teams([])
+        []
+        >>> main._normalize_token_teams(["team_a", "team_b"])
+        ['team_a', 'team_b']
+        >>> main._normalize_token_teams([{"id": "team_a", "name": "Team A"}])
+        ['team_a']
+        >>> main._normalize_token_teams([{"id": "t1"}, "t2", {"name": "no_id"}])
+        ['t1', 't2']
+    """
+    if not teams:
+        return []
+
+    normalized = []
+    for team in teams:
+        if isinstance(team, dict):
+            team_id = team.get("id")
+            if team_id:
+                normalized.append(team_id)
+        elif isinstance(team, str):
+            normalized.append(team)
+    return normalized
+
+
+def _get_token_teams_from_request(request: Request) -> Optional[List[str]]:
+    """
+    Extract and normalize teams from verified JWT token.
+
+    SECURITY: Uses normalize_token_teams for consistent secure-first semantics:
+        - teams key missing → [] (public-only, secure default)
+        - teams key null + is_admin=true → None (admin bypass)
+        - teams key null + is_admin=false → [] (public-only)
+        - teams key [] → [] (explicit public-only)
+        - teams key [...] → normalized list of string IDs
+
+    First checks request.state.token_teams (set by auth.py), then falls back
+    to calling normalize_token_teams on the JWT payload.
+
+    Args:
+        request: FastAPI request object
+
+    Returns:
+        None for admin bypass, [] for public-only, or list of normalized team ID strings.
+
+    Examples:
+        >>> from mcpgateway import main
+        >>> from unittest.mock import MagicMock
+        >>> req = MagicMock()
+        >>> req.state = MagicMock()
+        >>> req.state.token_teams = ["team_a"]  # Already normalized by auth.py
+        >>> main._get_token_teams_from_request(req)
+        ['team_a']
+        >>> req.state.token_teams = []  # Public-only
+        >>> main._get_token_teams_from_request(req)
+        []
+    """
+    internal_auth_context = _get_internal_mcp_auth_context(request)
+    if isinstance(internal_auth_context, dict) and "teams" in internal_auth_context:
+        internal_teams = internal_auth_context.get("teams")
+        if internal_teams is None or isinstance(internal_teams, list):
+            return internal_teams
+
+    # SECURITY: First check request.state.token_teams (already normalized by auth.py)
+    # This is the preferred path as auth.py has already applied normalize_token_teams
+    # Use getattr with a sentinel to distinguish "not set" from "set to None"
+    _not_set = object()
+    token_teams = getattr(request.state, "token_teams", _not_set)
+    if token_teams is not _not_set and (token_teams is None or isinstance(token_teams, list)):
+        return token_teams
+
+    # Fallback: Use cached verified payload and call normalize_token_teams
+    cached = getattr(request.state, "_jwt_verified_payload", None)
+    if cached and isinstance(cached, tuple) and len(cached) == 2:
+        _, payload = cached
+        if payload:
+            # Use normalize_token_teams for consistent secure-first semantics
+            return normalize_token_teams(payload)
+
+    # No JWT payload - return [] for public-only (secure default)
+    return []
+
+
+def _get_rpc_filter_context(request: Request, user) -> tuple:
+    """
+    Extract user_email, token_teams, and is_admin for RPC filtering.
+
+    Args:
+        request: FastAPI request object
+        user: User object from auth dependency
+
+    Returns:
+        Tuple of (user_email, token_teams, is_admin)
+
+    Examples:
+        >>> from mcpgateway import main
+        >>> from unittest.mock import MagicMock
+        >>> req = MagicMock()
+        >>> req.state = MagicMock()
+        >>> req.state._jwt_verified_payload = ("token", {"teams": ["t1"], "is_admin": True})
+        >>> user = {"email": "test@x.com", "is_admin": True}  # User's is_admin is ignored
+        >>> email, teams, is_admin = main._get_rpc_filter_context(req, user)
+        >>> email
+        'test@x.com'
+        >>> teams
+        ['t1']
+        >>> is_admin  # From token payload, not user dict
+        True
+    """
+    # Get user email
+    if hasattr(user, "email"):
+        user_email = getattr(user, "email", None)
+    elif isinstance(user, dict):
+        user_email = user.get("sub") or user.get("email")
+    else:
+        user_email = str(user) if user else None
+
+    # Get normalized teams from verified token
+    token_teams = _get_token_teams_from_request(request)
+
+    # Check if user is admin - MUST come from token, not DB user
+    # This ensures that tokens with restricted scope (empty teams) don't inherit admin bypass
+    is_admin = False
+    internal_auth_context = _get_internal_mcp_auth_context(request)
+    if isinstance(internal_auth_context, dict):
+        if user_email is None:
+            user_email = internal_auth_context.get("email")
+        is_admin = bool(internal_auth_context.get("is_admin", False))
+        if token_teams is not None and len(token_teams) == 0:
+            is_admin = False
+        return user_email, token_teams, is_admin
+
+    cached = getattr(request.state, "_jwt_verified_payload", None)
+    if cached and isinstance(cached, tuple) and len(cached) == 2:
+        _, payload = cached
+        if payload:
+            # Check both top-level is_admin and nested user.is_admin in token
+            is_admin = payload.get("is_admin", False) or payload.get("user", {}).get("is_admin", False)
+
+    # If token has empty teams array (public-only token), admin bypass is disabled
+    # This allows admins to create properly scoped tokens for restricted access
+    if token_teams is not None and len(token_teams) == 0:
+        is_admin = False
+
+    return user_email, token_teams, is_admin
+
+
+def _has_verified_jwt_payload(request: Request) -> bool:
+    """Return whether request has a verified JWT payload cached in request state.
+
+    Args:
+        request: Incoming request context.
+
+    Returns:
+        ``True`` when a verified payload tuple is present, otherwise ``False``.
+    """
+    internal_auth_context = _get_internal_mcp_auth_context(request)
+    if isinstance(internal_auth_context, dict):
+        return True
+    cached = getattr(request.state, "_jwt_verified_payload", None)
+    return bool(cached and isinstance(cached, tuple) and len(cached) == 2 and cached[1])
+
+
+def _get_request_identity(request: Request, user) -> tuple[str, bool]:
+    """Return requester email and admin state honoring scoped-token semantics.
+
+    Args:
+        request: Incoming request context.
+        user: Authenticated user context from dependency resolution.
+
+    Returns:
+        Tuple of ``(requester_email, requester_is_admin)``.
+    """
+    user_email, _token_teams, token_is_admin = _get_rpc_filter_context(request, user)
+    resolved_email = user_email or get_user_email(user)
+
+    # If a JWT payload exists, respect token-derived admin semantics (including
+    # public-only admin tokens where bypass is intentionally disabled).
+    if _has_verified_jwt_payload(request):
+        return resolved_email, token_is_admin
+
+    fallback_is_admin = False
+    if hasattr(user, "is_admin"):
+        fallback_is_admin = bool(getattr(user, "is_admin", False))
+    elif isinstance(user, dict):
+        fallback_is_admin = bool(user.get("is_admin", False) or user.get("user", {}).get("is_admin", False))
+
+    return resolved_email, token_is_admin or fallback_is_admin
+
+
+def _get_scoped_resource_access_context(request: Request, user) -> tuple[Optional[str], Optional[List[str]]]:
+    """Resolve scoped resource access context for the current requester.
+
+    Args:
+        request: Incoming request context.
+        user: Authenticated user context from dependency resolution.
+
+    Returns:
+        Tuple of ``(user_email, token_teams)`` where ``(None, None)`` represents
+        unrestricted admin access and ``[]`` represents public-only scope.
+    """
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+    # Non-JWT admin contexts (for example basic-auth development mode) should
+    # keep unrestricted access semantics.
+    if not _has_verified_jwt_payload(request):
+        _requester_email, fallback_admin = _get_request_identity(request, user)
+        if fallback_admin:
+            return None, None
+
+    if is_admin and token_teams is None:
+        return None, None
+    if token_teams is None:
+        return user_email, []
+    return user_email, token_teams
+
+
+def _build_rpc_permission_user(user, db: Session) -> dict[str, Any]:
+    """Build PermissionChecker user payload for method-level RPC checks.
+
+    Args:
+        user: Authenticated user context.
+        db: Active database session.
+
+    Returns:
+        Permission checker payload with email and ``db`` keys.
+    """
+    permission_user = dict(user) if isinstance(user, dict) else {"email": get_user_email(user)}
+    if not permission_user.get("email"):
+        permission_user["email"] = get_user_email(user)
+    permission_user["db"] = db
+    return permission_user
+
+
+def _extract_scoped_permissions(request: Request) -> set[str] | None:
+    """Extract token scopes.permissions from cached JWT payload.
+
+    Args:
+        request: Incoming request context.
+
+    Returns:
+        None: no explicit scope cap (empty permissions or no JWT — defer to RBAC)
+        set: explicit permission set (may contain '*' for wildcard)
+    """
+    internal_auth_context = _get_internal_mcp_auth_context(request)
+    if isinstance(internal_auth_context, dict):
+        permissions = internal_auth_context.get("scoped_permissions")
+        if not permissions:
+            return None
+        return set(permissions)
+
+    cached = getattr(request.state, "_jwt_verified_payload", None)
+    if not cached or not isinstance(cached, tuple) or len(cached) != 2:
+        return None
+    _, payload = cached
+    if not payload or not isinstance(payload, dict):
+        return None
+    scopes = payload.get("scopes")
+    if not scopes or not isinstance(scopes, dict):
+        return None
+    permissions = scopes.get("permissions")
+    if not permissions:  # Empty list or None = defer to RBAC
+        return None
+    return set(permissions)
+
+
+def _is_permission_admin_user(user) -> bool:
+    """Return whether the caller already has permission-layer admin authority.
+
+    This is stricter than token-scope admin semantics. It is used only to skip
+    redundant RBAC DB lookups after token scope caps have already been enforced.
+
+    Args:
+        user: Authenticated user object or dict-like payload.
+
+    Returns:
+        ``True`` when the caller already has permission-layer admin authority.
+    """
+    if hasattr(user, "is_admin"):
+        return bool(getattr(user, "is_admin", False))
+    if isinstance(user, dict):
+        if "permission_is_admin" in user:
+            return bool(user.get("permission_is_admin", False))
+        return False
+    return False
+
+
+async def _ensure_rpc_permission(user, db: Session, permission: str, method: str, request: Request | None = None) -> None:
+    """Require a specific RPC permission for a method branch.
+
+    Enforces both layers:
+    1. Token scopes.permissions cap (if explicit permissions present)
+    2. RBAC role-based permission check
+
+    Args:
+        user: Authenticated user context.
+        db: Active database session.
+        permission: Permission required for the method.
+        method: JSON-RPC method name being authorized.
+        request: Optional FastAPI request for extracting token scopes.
+
+    Raises:
+        JSONRPCError: If the requester lacks the required permission.
+    """
+    # Layer 1: Token scope cap
+    if request is not None:
+        scoped = _extract_scoped_permissions(request)
+        if scoped is not None and "*" not in scoped and permission not in scoped:
+            logger.warning("RPC permission denied (token scope): method=%s, required=%s", method, permission)
+            raise JSONRPCError(-32003, _ACCESS_DENIED_MSG, {"method": method})
+
+    if permission == "admin.system_config" and _is_permission_admin_user(user):
+        return
+
+    # Layer 2: RBAC check
+    # Session tokens have no explicit team_id, so check across all team-scoped roles.
+    # Mirrors the @require_permission decorator's check_any_team fallback (rbac.py:562-576).
+    check_any_team = isinstance(user, dict) and user.get("token_use") == "session"
+    checker = PermissionChecker(_build_rpc_permission_user(user, db))
+    if not await checker.has_permission(permission, check_any_team=check_any_team):
+        logger.warning("RPC permission denied (RBAC): method=%s, required=%s", method, permission)
+        raise JSONRPCError(-32003, _ACCESS_DENIED_MSG, {"method": method})
+
+
+def _serialize_mcp_tool_definition(tool: Any) -> Dict[str, Any]:
+    """Return an MCP-compliant tool definition without API-only metadata fields.
+
+    Args:
+        tool: Tool ORM object, pydantic model, or dict-like payload.
+
+    Returns:
+        MCP-compatible tool definition dictionary.
+    """
+    if hasattr(tool, "model_dump"):
+        data = tool.model_dump(by_alias=True, exclude_none=True)
+    elif isinstance(tool, dict):
+        data = dict(tool)
+    else:
+        data = {}
+
+    name = data.get("name", getattr(tool, "name", None))
+    description = data.get("description", getattr(tool, "description", None))
+    input_schema = data.get("inputSchema", getattr(tool, "input_schema", None))
+
+    payload: Dict[str, Any] = {}
+    if name is not None:
+        payload["name"] = name
+    if description is not None or name is not None or input_schema is not None:
+        payload["description"] = description or ""
+    if input_schema is not None:
+        payload["inputSchema"] = input_schema
+
+    output_schema = data.get("outputSchema", getattr(tool, "output_schema", None))
+    if output_schema is not None:
+        payload["outputSchema"] = output_schema
+
+    annotations = data.get("annotations", getattr(tool, "annotations", None))
+    if annotations is not None:
+        payload["annotations"] = annotations
+
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _serialize_mcp_tool_definitions(tools: List[Any]) -> List[Dict[str, Any]]:
+    """Serialize tool records to MCP tool definitions.
+
+    Args:
+        tools: Iterable of tool-like records to serialize.
+
+    Returns:
+        List of MCP-compatible tool definitions.
+    """
+    return [_serialize_mcp_tool_definition(tool) for tool in tools]
+
+
+def _serialize_legacy_tool_payloads(tools: List[Any]) -> List[Dict[str, Any]]:
+    """Serialize tool records using the legacy JSON-RPC shape.
+
+    Args:
+        tools: Iterable of tool-like records to serialize.
+
+    Returns:
+        List of legacy tool payload dictionaries.
+    """
+    payloads: List[Dict[str, Any]] = []
+    for tool in tools:
+        if hasattr(tool, "model_dump"):
+            payload = tool.model_dump(by_alias=True, exclude_none=True)
+        elif isinstance(tool, dict):
+            payload = dict(tool)
+        else:
+            payload = {}
+        payloads.append(payload)
+    return payloads
+
+
+def _enforce_scoped_resource_access(request: Request, db: Session, user, resource_path: str) -> None:
+    """Apply token-scope ownership checks for a concrete resource path.
+
+    This provides defense-in-depth for ID-based handlers so they continue to
+    enforce visibility even if middleware coverage regresses.
+
+    Args:
+        request: Incoming request context.
+        db: Active database session.
+        user: Authenticated user context.
+        resource_path: Canonical resource path (e.g. ``/tools/{id}``).
+
+    Raises:
+        HTTPException: If access to the target resource is not allowed.
+    """
+    scoped_user_email, scoped_token_teams = _get_scoped_resource_access_context(request, user)
+
+    # Admin bypass / unrestricted scope
+    if scoped_token_teams is None:
+        return
+
+    if not token_scoping_middleware._check_resource_team_ownership(  # pylint: disable=protected-access
+        resource_path,
+        scoped_token_teams,
+        db=db,
+        _user_email=scoped_user_email,
+    ):
+        logger.warning("Scoped resource access denied: user=%s, resource=%s", scoped_user_email, resource_path)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_ACCESS_DENIED_MSG)
+
+
+async def _assert_session_owner_or_admin(request: Request, user, session_id: str) -> None:
+    """Ensure session operations are limited to the owner unless requester is admin.
+
+    Args:
+        request: Incoming request context.
+        user: Authenticated user context.
+        session_id: Target session identifier.
+
+    Raises:
+        HTTPException: If session is missing or requester is not authorized.
+    """
+    session_owner = await session_registry.get_session_owner(session_id)
+    if not session_owner:
+        session_exists = await session_registry.session_exists(session_id)
+        if session_exists is False:
+            raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=403, detail="Session owner metadata unavailable")
+
+    requester_email, requester_is_admin = _get_request_identity(request, user)
+    if requester_is_admin:
+        return
+    if requester_email and requester_email == session_owner:
+        return
+    raise HTTPException(status_code=403, detail="Session access denied")
+
+
+async def _authorize_run_cancellation(request: Request, user, request_id: str, *, as_jsonrpc_error: bool) -> None:
+    """Authorize a notifications/cancelled request for a specific run id.
+
+    Args:
+        request: Incoming request context.
+        user: Authenticated user context.
+        request_id: Run/request identifier to cancel.
+        as_jsonrpc_error: Raise ``JSONRPCError`` when True, otherwise ``HTTPException``.
+
+    Raises:
+        JSONRPCError: When ``as_jsonrpc_error`` is True and cancellation is not authorized.
+        HTTPException: When ``as_jsonrpc_error`` is False and cancellation is not authorized.
+    """
+    requester_email, requester_token_teams, requester_is_admin = _get_rpc_filter_context(request, user)
+    requester_teams = [] if requester_token_teams is None else list(requester_token_teams)
+    run_status = await cancellation_service.get_status(request_id)
+
+    if run_status is None:
+        # Notifications are best-effort; unknown request ids should be accepted
+        # as no-ops rather than rejected as authorization failures.
+        return
+
+    run_owner_email = run_status.get("owner_email")
+    run_owner_team_ids = run_status.get("owner_team_ids") or []
+    requester_is_owner = bool(run_owner_email and requester_email and run_owner_email == requester_email)
+    requester_shares_team = bool(run_owner_team_ids and requester_teams and any(team in run_owner_team_ids for team in requester_teams))
+    unauthorized = not requester_is_admin and not requester_is_owner and not requester_shares_team
+
+    if unauthorized:
+        if as_jsonrpc_error:
+            raise JSONRPCError(-32003, "Not authorized to cancel this run", {"requestId": request_id})
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to cancel this run")
+
+
+# Initialize cache
+resource_cache = ResourceCache(max_size=settings.resource_cache_size, ttl=settings.resource_cache_ttl)
+
+
+def _rust_build_included() -> bool:
+    """Return whether the current image includes Rust MCP artifacts.
+
+    Returns:
+        ``True`` when the current image contains the Rust MCP binaries/plugins.
+    """
+    return version_module.rust_build_included()
+
+
+def _rust_runtime_managed() -> bool:
+    """Return whether the gateway expects to manage the Rust MCP sidecar locally.
+
+    Returns:
+        ``True`` when the gateway should launch and supervise the Rust sidecar.
+    """
+    return version_module.rust_runtime_managed()
+
+
+def _current_mcp_transport_mount() -> str:
+    """Return which public /mcp transport is currently mounted.
+
+    Returns:
+        Runtime label identifying the currently mounted public MCP transport.
+    """
+    return version_module.current_mcp_transport_mount()
+
+
+def _should_mount_public_rust_transport() -> bool:
+    """Return whether the public ``/mcp`` path should be served directly by Rust.
+
+    Returns:
+        ``True`` only when the Rust runtime is enabled and the session-auth reuse
+        path is enabled, allowing Rust to safely own steady-state public MCP
+        session traffic. Otherwise returns ``False`` and leaves public MCP on
+        the Python ingress path.
+    """
+    return version_module.should_mount_public_rust_transport()
+
+
+def _should_use_rust_public_session_stack() -> bool:
+    """Return whether Rust should own the effective public MCP session stack.
+
+    Returns:
+        ``True`` only when the Rust runtime is enabled and session-auth reuse is
+        enabled, allowing the public transport, session metadata, replay/resume,
+        live-stream, and affinity behavior to stay on a consistent Rust-backed
+        path. Otherwise returns ``False`` so the public MCP session stack falls
+        back to Python semantics.
+    """
+    return version_module.should_use_rust_public_session_stack()
+
+
+def _current_mcp_runtime_mode() -> str:
+    """Return a compact runtime-mode label for observability.
+
+    Returns:
+        Human-readable runtime mode label for health/readiness reporting.
+    """
+    return version_module.current_mcp_runtime_mode()
+
+
+def _current_mcp_session_core_mode() -> str:
+    """Return which session core currently owns MCP session metadata.
+
+    Returns:
+        ``"rust"`` when the Rust session core is enabled, otherwise ``"python"``.
+    """
+    return version_module.current_mcp_session_core_mode()
+
+
+def _current_mcp_event_store_mode() -> str:
+    """Return which runtime currently owns MCP resumable event-store semantics.
+
+    Returns:
+        ``"rust"`` when the Rust event store is enabled, otherwise ``"python"``.
+    """
+    return version_module.current_mcp_event_store_mode()
+
+
+def _current_mcp_resume_core_mode() -> str:
+    """Return which runtime currently owns public MCP replay/resume behavior.
+
+    Returns:
+        ``"rust"`` when Rust owns replay/resume, otherwise ``"python"``.
+    """
+    return version_module.current_mcp_resume_core_mode()
+
+
+def _current_mcp_live_stream_core_mode() -> str:
+    """Return which runtime currently owns non-resume public GET /mcp SSE behavior.
+
+    Returns:
+        ``"rust"`` when Rust owns live GET /mcp streaming, otherwise ``"python"``.
+    """
+    return version_module.current_mcp_live_stream_core_mode()
+
+
+def _current_mcp_affinity_core_mode() -> str:
+    """Return which runtime currently owns MCP multi-worker session-affinity forwarding.
+
+    Returns:
+        ``"rust"`` when Rust owns session-affinity forwarding, otherwise ``"python"``.
+    """
+    return version_module.current_mcp_affinity_core_mode()
+
+
+def _current_mcp_session_auth_reuse_mode() -> str:
+    """Return which runtime currently owns MCP session-bound auth-context reuse.
+
+    Returns:
+        ``"rust"`` when Rust session auth reuse is enabled, otherwise ``"python"``.
+    """
+    return version_module.current_mcp_session_auth_reuse_mode()
+
+
+def _mcp_runtime_status_payload() -> Dict[str, Any]:
+    """Return MCP runtime diagnostics for health/readiness endpoints.
+
+    Returns:
+        Diagnostic payload describing the active MCP runtime configuration.
+    """
+    return version_module.mcp_runtime_status_payload()
+
+
+def _apply_runtime_mode_headers(response: Response) -> None:
+    """Attach MCP runtime mode headers to a response.
+
+    Args:
+        response: Response object to annotate.
+    """
+    response.headers["x-contextforge-mcp-runtime-mode"] = _current_mcp_runtime_mode()
+    response.headers["x-contextforge-mcp-transport-mounted"] = _current_mcp_transport_mount()
+    response.headers["x-contextforge-rust-build-included"] = "true" if _rust_build_included() else "false"
+    response.headers["x-contextforge-mcp-session-core-mode"] = _current_mcp_session_core_mode()
+    response.headers["x-contextforge-mcp-event-store-mode"] = _current_mcp_event_store_mode()
+    response.headers["x-contextforge-mcp-resume-core-mode"] = _current_mcp_resume_core_mode()
+    response.headers["x-contextforge-mcp-live-stream-core-mode"] = _current_mcp_live_stream_core_mode()
+    response.headers["x-contextforge-mcp-affinity-core-mode"] = _current_mcp_affinity_core_mode()
+    response.headers["x-contextforge-mcp-session-auth-reuse-mode"] = _current_mcp_session_auth_reuse_mode()
+
+
+# Type aliases for improved readability
+ToolsResponse: TypeAlias = Union[List[ToolRead], CursorPaginatedToolsResponse, List[Dict[Any, Any]], Dict[Any, Any], ORJSONResponse]
+ToolResponse: TypeAlias = Union[ToolRead, Dict[Any, Any], ORJSONResponse]
+
+
+@lru_cache(maxsize=512)
+def _parse_jsonpath(jsonpath: str) -> JSONPath:
+    """Cache parsed JSONPath expression.
+
+    Args:
+        jsonpath: The JSONPath expression string.
+
+    Returns:
+        Parsed JSONPath object.
+
+    Raises:
+        Exception: If the JSONPath expression is invalid.
+    """
+    return parse(jsonpath)
+
+
+def _parse_apijsonpath(raw: Optional[Union[str, JsonPathModifier]]) -> Optional[JsonPathModifier]:
+    """
+    Parse apijsonpath parameter from either a JSON string or a JsonPathModifier model.
+
+    Performs early validation of JSONPath syntax to fail fast and provide clear error messages.
+
+    Args:
+        raw: Either a JSON-encoded string or a JsonPathModifier instance
+
+    Returns:
+        Parsed JsonPathModifier or None if raw is None
+
+    Raises:
+        HTTPException: If the JSON string is invalid, unexpected type provided,
+                      jsonpath expression is empty, or JSONPath syntax is invalid (400 Bad Request)
+    """
+    if raw is None:
+        return None
+
+    if isinstance(raw, str):
+        try:
+            parsed = JsonPathModifier.model_validate(json.loads(raw))
+            # Validate jsonpath is not empty if provided
+            if parsed.jsonpath is not None:
+                if not parsed.jsonpath.strip():
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="JSONPath expression cannot be empty")
+                # Early validation: ensure JSONPath syntax is valid
+                try:
+                    _parse_jsonpath(parsed.jsonpath)
+                except Exception as parse_ex:
+                    detail = f"Invalid JSONPath syntax: {parse_ex}" if settings.log_level == "DEBUG" else "Invalid JSONPath expression"
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+            return parsed
+        except HTTPException:
+            # Re-raise HTTPException as-is (includes empty jsonpath and syntax validation)
+            raise
+        except json.JSONDecodeError as ex:
+            # User error: malformed JSON (JSONDecodeError is subclass of ValueError, so catch it specifically)
+            detail = f"Invalid apijsonpath JSON: {ex}" if settings.log_level == "DEBUG" else "Invalid apijsonpath format"
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        except ValidationError as ex:
+            # Pydantic validation error
+            detail = f"Invalid apijsonpath structure: {ex}" if settings.log_level == "DEBUG" else "Invalid apijsonpath structure"
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        except Exception as ex:
+            # Unexpected error - log it and return generic message
+            logger.error(f"Unexpected error parsing apijsonpath: {ex}", exc_info=True)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to parse apijsonpath")
+    elif isinstance(raw, JsonPathModifier):
+        # Validate jsonpath is not empty if provided
+        if raw.jsonpath is not None:
+            if not raw.jsonpath.strip():
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="JSONPath expression cannot be empty")
+            # Early validation: ensure JSONPath syntax is valid
+            try:
+                _parse_jsonpath(raw.jsonpath)
+            except Exception as parse_ex:
+                detail = f"Invalid JSONPath syntax: {parse_ex}" if settings.log_level == "DEBUG" else "Invalid JSONPath expression"
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        return raw
+
+    # Unexpected type - fail fast with clear error message
+    # Only show type name in debug mode to avoid information disclosure
+    type_info = f": got {type(raw).__name__}" if settings.log_level == "DEBUG" else ""
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid apijsonpath type{type_info}")
+
+
+def jsonpath_modifier(data: Any, jsonpath: str = "$[*]", mappings: Optional[Dict[str, str]] = None) -> Union[List, Dict]:
+    """
+    Applies the given JSONPath expression and mappings to the data.
+    Uses cached parsed expressions for performance.
+
+    Args:
+        data: The JSON data to query.
+        jsonpath: The JSONPath expression to apply.
+        mappings: Optional dictionary of mappings where keys are new field names
+                  and values are JSONPath expressions.
+
+    Returns:
+        Union[List, Dict]: A list (or mapped list) or a Dict of extracted data.
+
+    Raises:
+        HTTPException: If there's an error parsing or executing the JSONPath expressions.
+
+    Examples:
+        >>> jsonpath_modifier({'a': 1, 'b': 2}, '$.a')
+        [1]
+        >>> jsonpath_modifier([{'a': 1}, {'a': 2}], '$[*].a')
+        [1, 2]
+        >>> jsonpath_modifier({'a': {'b': 2}}, '$.a.b')
+        [2]
+        >>> jsonpath_modifier({'a': 1}, '$.b')
+        []
+    """
+    if not jsonpath:
+        jsonpath = "$[*]"
+
+    # Log jsonpath_modifier invocation with structured data (only if debug enabled)
+    if logger.isEnabledFor(logging.DEBUG):
+        data_length = len(data) if isinstance(data, list) else None
+        logger.debug(f"jsonpath_modifier: path='{SecurityValidator.sanitize_log_message(jsonpath)}', has_mappings={mappings is not None}, data_type={type(data).__name__}, data_length={data_length}")
+
+    try:
+        main_expr: JSONPath = _parse_jsonpath(jsonpath)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid main JSONPath expression: {e}")
+
+    try:
+        main_matches = main_expr.find(data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error executing main JSONPath: {e}")
+
+    results = [match.value for match in main_matches]
+
+    if mappings:
+        results = transform_data_with_mappings(results, mappings)
+
+    if len(results) == 1 and isinstance(results[0], dict):
+        return results[0]
+
+    return results
+
+
+def transform_data_with_mappings(data: list[Any], mappings: dict[str, str]) -> list[Any]:
+    """
+    Applies mappings to data using cached JSONPath expressions.
+    Parses each mapping expression once per call, not per item.
+
+    Args:
+        data: The set of data to apply mappings to.
+        mappings: dictionary of mappings where keys are new field names
+
+    Returns:
+        list[Any]: A list (or mapped list) of re-mapped data
+
+    Raises:
+        HTTPException: If there's an error parsing or executing the JSONPath expressions.
+
+    Examples:
+        >>> transform_data_with_mappings([{'first_name': "Bruce", 'second_name': "Wayne"},{'first_name': "Diana", 'second_name': "Prince"}], {"n": "$.first_name"})
+        [{'n': 'Bruce'}, {'n': 'Diana'}]
+    """
+    # Pre-parse all mapping expressions once (not per item)
+    parsed_mappings: Dict[str, JSONPath] = {}
+    for new_key, mapping_expr_str in mappings.items():
+        try:
+            parsed_mappings[new_key] = _parse_jsonpath(mapping_expr_str)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid mapping JSONPath for key '{new_key}': {e}")
+
+    mapped_results = []
+    for item in data:
+        mapped_item = {}
+        for new_key, mapping_expr in parsed_mappings.items():
+            try:
+                mapping_matches = mapping_expr.find(item)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error executing mapping JSONPath for key '{new_key}': {e}")
+
+            if not mapping_matches:
+                mapped_item[new_key] = None
+            elif len(mapping_matches) == 1:
+                mapped_item[new_key] = mapping_matches[0].value
+            else:
+                mapped_item[new_key] = [m.value for m in mapping_matches]
+        mapped_results.append(mapped_item)
+
+    return mapped_results
+
+
+async def attempt_to_bootstrap_sso_providers():
+    """
+    Try to bootstrap SSO provider services based on settings.
+    """
+    try:
+        # First-Party
+        from mcpgateway.utils.sso_bootstrap import bootstrap_sso_providers  # pylint: disable=import-outside-toplevel
+
+        await bootstrap_sso_providers()
+        logger.info("SSO providers bootstrapped successfully")
+    except Exception as e:
+        logger.warning(f"Failed to bootstrap SSO providers: {e}")
+
+
+####################
+# Startup/Shutdown #
+####################
+def _can_manage_sighup_handler() -> bool:
+    """Return whether this runtime context can safely install process signal handlers.
+
+    Returns:
+        ``True`` when startup is running on the process main thread and SIGHUP is available.
+    """
+    return hasattr(signal, "SIGHUP") and threading.current_thread() is threading.main_thread()
+
+
+def _install_sighup_handler() -> bool:
+    """Install the SIGHUP handler when the current runtime context supports it.
+
+    Returns:
+        ``True`` when the handler was installed in the current runtime context.
+    """
+    if not _can_manage_sighup_handler():
+        logger.debug("Skipping SIGHUP handler registration outside the main thread")
+        return False
+
+    # First-Party
+    from mcpgateway.handlers.signal_handlers import sighup_handler  # pylint: disable=import-outside-toplevel
+
+    signal.signal(signal.SIGHUP, sighup_handler)
+    return True
+
+
+def _restore_default_sighup_handler() -> None:
+    """Restore the default SIGHUP handler when the current runtime context supports it.
+
+    Returns:
+        ``None``.
+    """
+    if not _can_manage_sighup_handler():
+        return
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """
+    Manage the application's startup and shutdown lifecycle.
+
+    The function initialises every core service on entry and then
+    shuts them down in reverse order on exit.
+
+    Args:
+        _app (FastAPI): FastAPI app
+
+    Yields:
+        None
+
+    Raises:
+        SystemExit: When a critical startup error occurs that prevents
+            the application from starting successfully.
+        Exception: Any unhandled error that occurs during service
+            initialisation or shutdown is re-raised to the caller.
+    """
+    aggregation_stop_event: Optional[asyncio.Event] = None
+    aggregation_loop_task: Optional[asyncio.Task] = None
+    aggregation_backfill_task: Optional[asyncio.Task] = None
+
+    # Initialize logging service FIRST to ensure all logging goes to dual output
+    await logging_service.initialize()
+    logger.info("Starting ContextForge services")
+
+    # Wait for the database to be ready, then run bootstrap (alembic + seed).
+    # This used to run at module-import time, which made every test that
+    # imported mcpgateway.main pay for a real DB probe and migration check.
+    # `wait_for_db_ready(sync=True)` is a blocking probe, so offload it to
+    # a worker thread to avoid stalling the event loop during startup.
+    # First-Party
+    from mcpgateway.bootstrap_db import main as bootstrap_db  # pylint: disable=import-outside-toplevel
+    from mcpgateway.utils.db_isready import wait_for_db_ready  # pylint: disable=import-outside-toplevel
+
+    await asyncio.to_thread(
+        wait_for_db_ready,
+        max_tries=int(settings.db_max_retries),
+        interval=int(settings.db_retry_interval_ms) / 1000,
+        sync=True,
+    )
+    await bootstrap_db()
+
+    # Initialize Redis client early (shared pool for all services)
+    await get_redis_client()
+
+    # Register the Redis provider with the plugin framework so framework
+    # modules can reach Redis without importing mcpgateway.utils directly
+    # (isolation enforced by scripts/pre-commit/check_framework_imports.py).
+    # First-Party
+    from mcpgateway.plugins.framework._redis import set_shared_redis_provider  # pylint: disable=import-outside-toplevel
+
+    set_shared_redis_provider(get_redis_client)
+
+    # Initialize shared HTTP client (connection pool for all outbound requests)
+    # First-Party
+    from mcpgateway.services.http_client_service import SharedHttpClient  # pylint: disable=import-outside-toplevel
+
+    await SharedHttpClient.get_instance()
+
+    # Update HTTP pool metrics after SharedHttpClient is initialized
+    if hasattr(app.state, "update_http_pool_metrics"):
+        app.state.update_http_pool_metrics()
+
+    # Initialize the session-affinity service (Redis-backed worker mapping,
+    # heartbeat, session-owner forwarding). Cross-worker upstream
+    # ``ClientSession`` state lives in ``UpstreamSessionRegistry`` —
+    # SessionAffinity owns only the affinity layer.
+    # Always initialize SessionAffinity, regardless of
+    # ``mcpgateway_session_affinity_enabled``. The affinity flag controls
+    # cross-worker Redis routing; the GET /mcp listener-claim dict
+    # (ADR-052) is single-node bookkeeping that lives on the same instance
+    # and needs to be a process-wide singleton even with affinity off.
+    # Without the always-init, the GET handler would fall back to a fresh
+    # ``SessionAffinity()`` per request → each request gets its own
+    # ``_listener_claims`` dict → two concurrent GETs both win the claim
+    # and the single-listener invariant is broken in the default
+    # single-node deployment.
+    #
+    # The Redis-backed background tasks (heartbeat, RPC listener) are
+    # internally gated on the affinity flag, so always-init is safe.
+    # First-Party
+    from mcpgateway.services.session_affinity import init_session_affinity  # pylint: disable=import-outside-toplevel
+
+    # Use enable_notifications=False here so we don't double-init the
+    # notification service — main.lifespan does that explicitly below.
+    init_session_affinity(enable_notifications=False)
+    logger.info(
+        "Session-affinity service initialized (affinity_enabled=%s)",
+        settings.mcpgateway_session_affinity_enabled,
+    )
+
+    # Initialize the upstream session registry (#4205). 1:1 binding between a
+    # downstream MCP session and its upstream session per gateway, replacing
+    # the old identity-keyed sharing semantics. Always on — no feature flag.
+    #
+    # Wire a notification handler factory so server-initiated messages can be
+    # forwarded to GET /mcp listeners (ADR-052). The factory bakes
+    # downstream_session_id into the per-session handler closure.
+    # First-Party
+    from mcpgateway.services.notification_service import init_notification_service  # pylint: disable=import-outside-toplevel
+    from mcpgateway.services.upstream_session_registry import init_upstream_session_registry  # pylint: disable=import-outside-toplevel
+
+    _notification_svc = init_notification_service()
+    # Initialize the worker before any session is wired through it.
+    # Without this, list_changed notifications enqueue into a service
+    # whose `_process_refresh_queue` worker never runs and refreshes
+    # silently never fire. The gateway_service is wired here
+    # unconditionally — the affinity branch's
+    # `start_affinity_notification_service` only re-runs under affinity,
+    # and without this hand-off the single-node default would leave
+    # `_gateway_service is None` and drop every refresh.
+    await _notification_svc.initialize(gateway_service=gateway_service)
+
+    def _notification_handler_factory(url: str, gateway_id, *, downstream_session_id: str):  # type: ignore[no-untyped-def]
+        """Per-session message handler that routes upstream notifications and forwards server-initiated messages to the GET /mcp listener (ADR-052)."""
+        return _notification_svc.create_message_handler(
+            gateway_id or url,
+            url,
+            downstream_session_id=downstream_session_id,
+        )
+
+    init_upstream_session_registry(message_handler_factory=_notification_handler_factory)
+    logger.info("Upstream session registry initialized (notification fanout enabled)")
+
+    # Initialize LLM chat router Redis client (only if LLM chat is enabled —
+    # importing the router pulls in the langchain stack which is several
+    # seconds of cold-start cost).
+    if settings.llmchat_enabled:
+        # First-Party
+        from mcpgateway.routers.llmchat_router import init_redis as init_llmchat_redis  # pylint: disable=import-outside-toplevel
+
+        await init_llmchat_redis()
+
+    # Initialize observability (Phoenix tracing)
+    init_telemetry()
+    logger.info("Observability initialized")
+
+    try:
+        # Validate security configuration
+        validate_security_configuration()
+
+        # Initialize the plugin manager factory whenever the YAML config is
+        # available. We used to gate this on ``settings.plugins.enabled`` but
+        # that broke runtime enable-from-disabled: a node that boots with the
+        # flag off would never create the factory, so a later shared-toggle
+        # flip to "enabled" from a peer worker left this node unable to run
+        # plugins until restart. Keep initialisation unconditional; gate
+        # *execution* on the shared toggle in ``get_plugin_manager``.
+        # First-Party
+        from mcpgateway.plugins.policy import HOOK_PAYLOAD_POLICIES  # pylint: disable=import-outside-toplevel
+
+        try:
+            init_plugin_manager_factory(
+                yaml_path=settings.plugins.config_file,
+                timeout=settings.plugins.plugin_timeout,
+                hook_policies=HOOK_PAYLOAD_POLICIES,
+                observability=None,  # Will be set later if needed
+                db_factory=SessionLocal,
+            )
+            logger.info("Plugin manager factory initialized")
+        except Exception as init_exc:
+            if settings.plugins.enabled:
+                # Operator asked for plugins — a failed init (bad YAML, missing
+                # plugin module, validation error) must be a hard boot failure
+                # rather than a silent no-op. Preserve the original loud-crash
+                # semantics; the outer lifespan handler logs and re-raises.
+                logger.error("Plugin manager factory initialization failed: %s", init_exc, exc_info=True)
+                raise
+            # Plugins disabled locally; we init opportunistically so a later
+            # shared-toggle flip from a peer worker can turn the subsystem on
+            # without restarting this node. If that opportunistic init fails,
+            # the gateway still boots — but mark the node degraded so
+            # ``get_plugin_manager`` emits an ERROR the first time the shared
+            # toggle asks us to serve plugins we can't actually run.
+            logger.warning(
+                "Plugin manager factory init failed (%s); runtime-enable from a peer worker will require this node to restart",
+                init_exc,
+            )
+            # First-Party
+            from mcpgateway.plugins.framework import mark_factory_init_degraded  # pylint: disable=import-outside-toplevel
+
+            mark_factory_init_degraded()
+
+        try:
+            plugin_manager = await get_plugin_manager()
+            if plugin_manager:
+                logger.info(f"Plugin manager initialized with {plugin_manager.plugin_count} plugins")
+                # Wire plugin manager to plugin service for admin endpoints
+                # First-Party
+                from mcpgateway.services.plugin_service import get_plugin_service  # pylint: disable=import-outside-toplevel
+
+                plugin_service = get_plugin_service()
+                plugin_service.set_plugin_manager(plugin_manager)
+                # Expose on app.state so the admin UI can show the correct enabled status
+                app.state.plugin_manager = plugin_manager
+        except Exception as diag_exc:
+            logger.error(f"Plugin manager initialization failed: {diag_exc}", exc_info=True)
+            raise
+
+        # Always start the invalidation listener when a factory is live, even
+        # if the local ``plugins.enabled`` setting is false. The listener
+        # early-exits when no Redis provider is registered, so single-node
+        # deployments don't spin.
+        await start_plugin_invalidation_listener()
+        logger.info("Plugin invalidation listener started")
+
+        # Wire observability adapter to plugin manager if observability is enabled
+        if settings.observability_enabled and _service is not None:  # pylint: disable=possibly-used-before-assignment
+            # First-Party
+            from mcpgateway.plugins.framework import set_global_observability  # pylint: disable=import-outside-toplevel
+            from mcpgateway.plugins.observability_adapter import ObservabilityServiceAdapter  # pylint: disable=import-outside-toplevel
+
+            set_global_observability(ObservabilityServiceAdapter(service=_service))
+            logger.info("🔍 Plugin observability adapter wired to ObservabilityService")
+
+        if settings.enable_header_passthrough:
+            await setup_passthrough_headers()
+        else:
+            logger.info("🔒 Header Passthrough: DISABLED")
+
+        await tool_service.initialize()
+        await resource_service.initialize()
+        await prompt_service.initialize()
+        await gateway_service.initialize()
+
+        # Start heartbeat, RPC listener, and notification service for
+        # multi-worker session affinity. The upstream-session pool is
+        # owned by ``UpstreamSessionRegistry`` and runs unconditionally;
+        # only the cross-worker affinity machinery is gated here.
+        if settings.mcpgateway_session_affinity_enabled:
+            # First-Party
+            from mcpgateway.services.session_affinity import (  # pylint: disable=import-outside-toplevel
+                get_session_affinity,
+                start_affinity_notification_service,
+            )
+
+            await start_affinity_notification_service(gateway_service)
+            pool = get_session_affinity()
+            pool.start_heartbeat()
+            pool._rpc_listener_task = asyncio.create_task(pool.start_rpc_listener())  # pylint: disable=protected-access
+            logger.info("Multi-worker session affinity heartbeat and RPC listener started")
+
+        await root_service.initialize()
+        await completion_service.initialize()
+        await sampling_handler.initialize()
+        await export_service.initialize()
+        await import_service.initialize()
+        if a2a_service:
+            await a2a_service.initialize()
+        await resource_cache.initialize()
+        await streamable_http_session.initialize()
+        await session_registry.initialize()
+
+        # Initialize OrchestrationService for tool cancellation if enabled
+        if settings.mcpgateway_tool_cancellation_enabled:
+            await cancellation_service.initialize()
+            logger.info("Tool cancellation feature enabled")
+        else:
+            logger.info("Tool cancellation feature disabled")
+
+        # Initialize elicitation service
+        if settings.mcpgateway_elicitation_enabled:
+            # First-Party
+            from mcpgateway.services.elicitation_service import get_elicitation_service  # pylint: disable=import-outside-toplevel
+
+            elicitation_service = get_elicitation_service()
+            await elicitation_service.start()
+            logger.info("Elicitation service initialized")
+
+        # Initialize metrics buffer service for batching metric writes
+        if settings.metrics_buffer_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
+
+            metrics_buffer_service = get_metrics_buffer_service()
+            await metrics_buffer_service.start()
+            if settings.db_metrics_recording_enabled:
+                logger.info("Metrics buffer service initialized")
+            else:
+                logger.info("Metrics buffer service initialized (recording disabled)")
+
+        # Initialize metrics cleanup service for automatic deletion of old metrics
+        if settings.metrics_cleanup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_cleanup_service import get_metrics_cleanup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_cleanup_service = get_metrics_cleanup_service()
+            await metrics_cleanup_service.start()
+            logger.info("Metrics cleanup service initialized (retention: %d days)", settings.metrics_retention_days)
+
+        # Initialize metrics rollup service for hourly aggregation
+        if settings.metrics_rollup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_rollup_service import get_metrics_rollup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_rollup_service = get_metrics_rollup_service()
+            await metrics_rollup_service.start()
+            logger.info("Metrics rollup service initialized (interval: %dh)", settings.metrics_rollup_interval_hours)
+
+        refresh_slugs_on_startup()
+
+        # Bootstrap SSO providers from environment configuration
+        if settings.sso_enabled:
+            await attempt_to_bootstrap_sso_providers()
+
+        logger.info("All services initialized successfully")
+
+        # Warn about unsafe UAID configuration if A2A is enabled
+        if settings.mcpgateway_a2a_enabled:
+            uaid_allowed_domains = getattr(settings, "uaid_allowed_domains", [])
+            if not uaid_allowed_domains:
+                logger.warning(
+                    "⚠️  SECURITY: UAID_ALLOWED_DOMAINS is empty - cross-gateway routing is unrestricted. "
+                    "This allows UAID-based routing to ANY domain, including internal networks. "
+                    "Production deployments MUST configure UAID_ALLOWED_DOMAINS to restrict routing to trusted domains only. "
+                    'Example: UAID_ALLOWED_DOMAINS=["trusted.example.com","gateway.example.org"]'
+                )
+
+        _install_sighup_handler()
+
+        # Start cache invalidation subscriber for cross-worker cache synchronization
+        # First-Party
+        from mcpgateway.cache.registry_cache import get_cache_invalidation_subscriber  # pylint: disable=import-outside-toplevel
+
+        cache_invalidation_subscriber = get_cache_invalidation_subscriber()
+        await cache_invalidation_subscriber.start()
+
+        # Start runtime-mode coordinator for cluster-wide override propagation
+        # First-Party
+        from mcpgateway.runtime_state import get_runtime_state_coordinator  # pylint: disable=import-outside-toplevel
+
+        runtime_state_coordinator = get_runtime_state_coordinator()
+        await runtime_state_coordinator.start()
+
+        # Reconfigure uvicorn loggers after startup to capture access logs in dual output
+        logging_service.configure_uvicorn_after_startup()
+
+        if settings.metrics_aggregation_enabled and settings.metrics_aggregation_auto_start:
+            aggregation_stop_event = asyncio.Event()
+            log_aggregator = get_log_aggregator()
+
+            async def run_log_backfill() -> None:
+                """Backfill log aggregation metrics for configured hours."""
+                hours = getattr(settings, "metrics_aggregation_backfill_hours", 0)
+                if hours <= 0:
+                    return
+                try:
+                    await asyncio.to_thread(log_aggregator.backfill, hours)
+                    logger.info("Log aggregation backfill completed for last %s hour(s)", hours)
+                except Exception as backfill_error:  # pragma: no cover - defensive logging
+                    logger.warning("Log aggregation backfill failed: %s", backfill_error)
+
+            async def run_log_aggregation_loop() -> None:
+                """Run continuous log aggregation at configured intervals.
+
+                Raises:
+                    asyncio.CancelledError: When aggregation is stopped
+                """
+                interval_seconds = max(1, int(settings.metrics_aggregation_window_minutes)) * 60
+                logger.info(
+                    "Starting log aggregation loop (window=%s min)",
+                    log_aggregator.aggregation_window_minutes,
+                )
+                try:
+                    while not aggregation_stop_event.is_set():
+                        try:
+                            await asyncio.to_thread(log_aggregator.aggregate_all_components)
+                        except Exception as agg_error:  # pragma: no cover - defensive logging
+                            logger.warning("Log aggregation loop iteration failed: %s", agg_error)
+
+                        try:
+                            await asyncio.wait_for(aggregation_stop_event.wait(), timeout=interval_seconds)
+                        except asyncio.TimeoutError:
+                            continue
+                except asyncio.CancelledError:
+                    logger.debug("Log aggregation loop cancelled")
+                    raise
+                finally:
+                    logger.info("Log aggregation loop stopped")
+
+            aggregation_backfill_task = asyncio.create_task(run_log_backfill())
+            aggregation_loop_task = asyncio.create_task(run_log_aggregation_loop())
+        elif settings.metrics_aggregation_enabled:
+            logger.info("Metrics aggregation auto-start disabled; performance metrics will be generated on-demand when requested.")
+
+        yield
+    except Exception as e:
+        logger.error(f"Error during startup: {str(e)}")
+        # For plugin errors, exit cleanly without stack trace spam
+        if "Plugin initialization failed" in str(e):
+            # Suppress uvicorn error logging for clean exit
+            logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+            raise SystemExit(1)
+        raise
+    finally:
+        # Restore default SIGHUP handling in case we reset signal handlers.
+        try:
+            _restore_default_sighup_handler()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Failed to restore default SIGHUP handler: {exc}")
+
+        if aggregation_stop_event is not None:
+            aggregation_stop_event.set()
+        for task in (aggregation_backfill_task, aggregation_loop_task):
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        # Stop the plugin invalidation listener before the factory so in-flight
+        # messages don't race with a half-torn-down cache.
+        try:
+            await stop_plugin_invalidation_listener()
+        except Exception as e:
+            logger.debug(f"Error stopping plugin invalidation listener: {e}")
+
+        # Shutdown global plugin manager factory (no-op when plugins were never initialised)
+        try:
+            await shutdown_plugin_manager_factory()
+            logger.info("Plugin manager shutdown complete")
+        except Exception as e:
+            logger.error(f"Error shutting down plugin manager: {str(e)}")
+
+        # Stop cache invalidation subscriber
+        try:
+            # First-Party
+            from mcpgateway.cache.registry_cache import get_cache_invalidation_subscriber  # pylint: disable=import-outside-toplevel
+
+            cache_invalidation_subscriber = get_cache_invalidation_subscriber()
+            await cache_invalidation_subscriber.stop()
+        except Exception as e:
+            logger.debug(f"Error stopping cache invalidation subscriber: {e}")
+
+        # Stop runtime-mode coordinator
+        try:
+            # First-Party
+            from mcpgateway.runtime_state import get_runtime_state_coordinator  # pylint: disable=import-outside-toplevel
+
+            await get_runtime_state_coordinator().stop()
+        except Exception as e:
+            logger.debug(f"Error stopping runtime-mode coordinator: {e}")
+
+        logger.info("Shutting down ContextForge services")
+        # await stop_streamablehttp()
+        # Build service list conditionally
+        services_to_shutdown: List[Any] = [
+            resource_cache,
+            sampling_handler,
+            import_service,
+            export_service,
+            logging_service,
+            completion_service,
+            root_service,
+            gateway_service,
+            prompt_service,
+            resource_service,
+            tool_service,
+            streamable_http_session,
+            session_registry,
+        ]
+
+        # Add cancellation service if enabled
+        if settings.mcpgateway_tool_cancellation_enabled:
+            services_to_shutdown.insert(0, cancellation_service)  # Shutdown early to stop accepting new cancellations
+
+        if a2a_service:
+            services_to_shutdown.insert(4, a2a_service)  # Insert after export_service
+
+        # Add elicitation service if enabled
+        if settings.mcpgateway_elicitation_enabled:
+            # First-Party
+            from mcpgateway.services.elicitation_service import get_elicitation_service  # pylint: disable=import-outside-toplevel
+
+            elicitation_service = get_elicitation_service()
+            services_to_shutdown.insert(5, elicitation_service)
+
+        # Add metrics buffer service if enabled (flush remaining metrics before shutdown)
+        if settings.metrics_buffer_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
+
+            metrics_buffer_service = get_metrics_buffer_service()
+            services_to_shutdown.insert(0, metrics_buffer_service)  # Shutdown first to flush metrics
+
+        # Add metrics rollup service if enabled (shutdown before cleanup)
+        if settings.metrics_rollup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_rollup_service import get_metrics_rollup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_rollup_service = get_metrics_rollup_service()
+            services_to_shutdown.insert(1, metrics_rollup_service)
+
+        # Add metrics cleanup service if enabled
+        if settings.metrics_cleanup_enabled:
+            # First-Party
+            from mcpgateway.services.metrics_cleanup_service import get_metrics_cleanup_service  # pylint: disable=import-outside-toplevel
+
+            metrics_cleanup_service = get_metrics_cleanup_service()
+            services_to_shutdown.insert(2, metrics_cleanup_service)
+
+        await shutdown_services(services_to_shutdown)
+
+        # Shutdown session-affinity service (before shared HTTP client).
+        if settings.mcpgateway_session_affinity_enabled:
+            # First-Party
+            from mcpgateway.services.session_affinity import close_session_affinity  # pylint: disable=import-outside-toplevel
+
+            await close_session_affinity()
+
+        # Drain upstream session registry (#4205): every (downstream_session_id,
+        # gateway_id) → upstream ClientSession owned by this worker is closed.
+        # First-Party
+        from mcpgateway.services.upstream_session_registry import shutdown_upstream_session_registry  # pylint: disable=import-outside-toplevel
+
+        await shutdown_upstream_session_registry()
+
+        # Shutdown shared HTTP client (after services, before Redis)
+        await SharedHttpClient.shutdown()
+
+        # Close Redis client last (after all services that use it)
+        await close_redis_client()
+
+        logger.info("Shutdown complete")
+
+
+async def shutdown_services(services_to_shutdown: list[Any]):
+    """
+    Awaits shutdown of services provided in a list
+
+    Args:
+        services_to_shutdown (list[Any]): list of services to shutdown
+    """
+    for service in services_to_shutdown:
+        try:
+            await service.shutdown()
+        except Exception as e:
+            logger.error(f"Error shutting down {service.__class__.__name__}: {str(e)}")
+
+
+async def setup_passthrough_headers():
+    """
+    Enables configuration and logs active settings as needed for when passthrough headers are enabled.
+    """
+    logger.info(f"🔄 Header Passthrough: ENABLED (default headers: {settings.default_passthrough_headers})")
+    if settings.enable_overwrite_base_headers:
+        logger.warning("⚠️  Base Header Override: ENABLED - Client headers can override gateway headers")
+    else:
+        logger.info("🔒 Base Header Override: DISABLED - Gateway headers take precedence")
+    db_gen = get_db()
+    db = next(db_gen)  # pylint: disable=stop-iteration-return
+    try:
+        await set_global_passthrough_headers(db)
+    finally:
+        db.commit()  # End transaction cleanly
+        db.close()
+
+
+# Initialize FastAPI app with orjson for 2-3x faster JSON serialization
+app = FastAPI(
+    title=settings.app_name,
+    version=__version__,
+    description="ContextForge AI Gateway — an AI gateway, registry, and proxy for MCP, A2A, and REST/gRPC APIs. Exposes a unified control plane with centralized governance, discovery, and observability. Optimizes agent and tool calling, and supports plugins.",
+    root_path=settings.app_root_path,
+    lifespan=lifespan,
+    default_response_class=ORJSONResponse,  # Use orjson for high-performance JSON serialization
+)
+
+# Setup metrics instrumentation
+setup_metrics(app)
+
+
+def validate_security_configuration():
+    """
+    Validate security configuration on startup.
+    This function encapsulates:
+     - verifying the configuration,
+     - logging the output for warnings,
+     - critical issues
+     - security recommendations
+
+     Args: None
+     Raises: Passthrough Errors/Exceptions but doesn't raise any of its own.
+    """
+    logger.info("🔒 Validating security configuration...")
+
+    # Get security status
+    security_status: settings.SecurityStatus = settings.get_security_status()
+    security_warnings = security_status["warnings"]
+
+    log_security_warnings(security_warnings)
+
+    # Critical security checks (fail startup only if REQUIRE_STRONG_SECRETS=true)
+    critical_issues = []
+
+    if settings.jwt_secret_key in ("my-test-key", "my-test-key-but-now-longer-than-32-bytes") and not settings.dev_mode:  # nosec B105 - checking for default values
+        critical_issues.append("Using default JWT secret in non-dev mode. Set JWT_SECRET_KEY environment variable!")
+
+    if settings.basic_auth_password.get_secret_value() == "changeme" and settings.mcpgateway_ui_enabled:  # nosec B105 - checking for default value
+        critical_issues.append("Admin UI enabled with default password. Set BASIC_AUTH_PASSWORD environment variable!")
+
+    log_critical_issues(critical_issues)
+
+    # UAID Cross-Gateway Routing Security Check
+    if not settings.uaid_allowed_domains:
+        if not settings.auth_required:
+            logger.error(
+                "⚠️  INSECURE CONFIGURATION: UAID_ALLOWED_DOMAINS is empty AND AUTH_REQUIRED=false. "
+                "Cross-gateway routing is enabled without domain restrictions or authentication. "
+                "This allows UAID-based agents to route to ANY remote gateway without validation. "
+                "STRONGLY RECOMMENDED: Set UAID_ALLOWED_DOMAINS to restrict routing to trusted domains only."
+            )
+        else:
+            logger.warning(
+                "⚠️  UAID_ALLOWED_DOMAINS is empty - cross-gateway routing allows ALL domains. "
+                "Any UAID-based agent can route to any remote gateway endpoint. "
+                "RECOMMENDED: Configure UAID_ALLOWED_DOMAINS to restrict routing to trusted gateways only. "
+                'Example: UAID_ALLOWED_DOMAINS=["trusted-gateway.example.com", "partner.org"]'
+            )
+
+    # Warn about ephemeral storage without strict user-in-DB mode
+    if not getattr(settings, "require_user_in_db", False):
+        is_ephemeral = ":memory:" in settings.database_url or settings.database_url == "sqlite:///./mcp.db"
+        if is_ephemeral:
+            logger.warning("Using potentially ephemeral storage with platform admin bootstrap enabled. Consider using persistent storage or setting REQUIRE_USER_IN_DB=true for production.")
+
+    # Warn about default JWT issuer/audience in non-development environments
+    if settings.environment != "development":
+        if settings.jwt_issuer == "mcpgateway":
+            logger.warning("Using default JWT_ISSUER in %s environment. Set a unique JWT_ISSUER per environment to prevent cross-environment token acceptance.", settings.environment)
+        if settings.jwt_audience == "mcpgateway-api":
+            logger.warning("Using default JWT_AUDIENCE in %s environment. Set a unique JWT_AUDIENCE per environment to prevent cross-environment token acceptance.", settings.environment)
+
+    log_security_recommendations(security_status)
+
+
+def log_security_warnings(security_warnings: list[str]):
+    """Log warnings from list of security warnings provided.
+
+    Args:
+        security_warnings: List of security warning messages.
+    """
+    if security_warnings:
+        logger.warning("=" * 60)
+        logger.warning("🚨 SECURITY WARNINGS DETECTED:")
+        logger.warning("=" * 60)
+        for warning in security_warnings:
+            logger.warning(f"  {warning}")
+        logger.warning("=" * 60)
+
+
+def log_critical_issues(critical_issues: list[Any]):
+    """
+    Log critical based on configuration settings
+    If REQUIRE_STRONG_SECRETS set, this will output critical errors and exit the mcpgateway server.
+
+    Args:
+        critical_issues: List
+
+    Returns: None
+    """
+    # Handle critical issues based on REQUIRE_STRONG_SECRETS setting
+    if critical_issues:
+        if settings.require_strong_secrets:
+            logger.error("=" * 60)
+            logger.error("💀 CRITICAL SECURITY ISSUES DETECTED:")
+            logger.error("=" * 60)
+            for issue in critical_issues:
+                logger.error(f"  ❌ {issue}")
+            logger.error("=" * 60)
+            logger.error("Startup aborted due to REQUIRE_STRONG_SECRETS=true")
+            logger.error("To proceed anyway, set REQUIRE_STRONG_SECRETS=false")
+            logger.error("=" * 60)
+            sys.exit(1)
+        else:
+            # Log as warnings if not enforcing
+            logger.warning("=" * 60)
+            logger.warning("⚠️  Critical security issues detected (REQUIRE_STRONG_SECRETS=false):")
+            for issue in critical_issues:
+                logger.warning(f"  • {issue}")
+            logger.warning("=" * 60)
+
+
+def log_security_recommendations(security_status: settings.SecurityStatus):
+    """
+    Log security recommendations based on configuration settings
+
+    Args:
+        security_status (settings.SecurityStatus): The SecurityStatus object for checking and logging current security settings from MCPGateway.
+
+    Returns: None
+    """
+    if not security_status["secure_secrets"] or not security_status["auth_enabled"]:
+        logger.info("=" * 60)
+        logger.info("📋 SECURITY RECOMMENDATIONS:")
+        logger.info("=" * 60)
+
+        if settings.jwt_secret_key in ("my-test-key", "my-test-key-but-now-longer-than-32-bytes"):  # nosec B105 - checking for default value
+            logger.info("  • Generate a strong JWT secret:")
+            logger.info("    python3 -c 'import secrets; print(secrets.token_urlsafe(32))'")
+
+        if settings.basic_auth_password.get_secret_value() == "changeme":  # nosec B105 - checking for default value
+            logger.info("  • Set a strong admin password in BASIC_AUTH_PASSWORD")
+
+        if not settings.auth_required:
+            logger.info("  • Enable authentication: AUTH_REQUIRED=true")
+
+        if settings.skip_ssl_verify:
+            logger.info("  • Enable SSL verification: SKIP_SSL_VERIFY=false")
+
+        logger.info("=" * 60)
+
+    logger.info("✅ Security validation completed")
+
+
+# Global exceptions handlers
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(_request: Request, exc: ValidationError):
+    """Handle Pydantic validation errors globally.
+
+    Intercepts ValidationError exceptions raised anywhere in the application
+    and returns a properly formatted JSON error response with detailed
+    validation error information.
+
+    Args:
+        _request: The FastAPI request object that triggered the validation error.
+                  (Unused but required by FastAPI's exception handler interface)
+        exc: The Pydantic ValidationError exception containing validation
+             failure details.
+
+    Returns:
+        JSONResponse: A 422 Unprocessable Entity response with formatted
+                      validation error details.
+
+    Examples:
+        >>> from pydantic import ValidationError, BaseModel
+        >>> from fastapi import Request
+        >>> import asyncio
+        >>>
+        >>> class TestModel(BaseModel):
+        ...     name: str
+        ...     age: int
+        >>>
+        >>> # Create a validation error
+        >>> try:
+        ...     TestModel(name="", age="invalid")
+        ... except ValidationError as e:
+        ...     # Test our handler
+        ...     result = asyncio.run(validation_exception_handler(None, e))
+        ...     result.status_code
+        422
+    """
+    return ORJSONResponse(status_code=422, content=ErrorFormatter.format_validation_error(exc))
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(_request: Request, exc: RequestValidationError):
+    """Handle FastAPI request validation errors (automatic request parsing).
+
+    This handles ValidationErrors that occur during FastAPI's automatic request
+    parsing before the request reaches your endpoint.
+
+    Args:
+        _request: The FastAPI request object that triggered validation error.
+        exc: The RequestValidationError exception containing failure details.
+
+    Returns:
+        JSONResponse: A 422 Unprocessable Entity response with error details.
+    """
+    if _request.url.path.startswith("/tools"):
+        error_details = []
+
+        for error in exc.errors():
+            loc = error.get("loc", [])
+            msg = error.get("msg", "Unknown error")
+            ctx = error.get("ctx", {"error": {}})
+            type_ = error.get("type", "value_error")
+            # Ensure ctx is JSON serializable
+            if isinstance(ctx, dict):
+                ctx_serializable = {k: (str(v) if isinstance(v, Exception) else v) for k, v in ctx.items()}
+            else:
+                ctx_serializable = str(ctx)
+            error_detail = {"type": type_, "loc": loc, "msg": msg, "ctx": ctx_serializable}
+            error_details.append(error_detail)
+
+        response_content = {"detail": error_details}
+        return ORJSONResponse(status_code=422, content=response_content)
+    return await fastapi_default_validation_handler(_request, exc)
+
+
+@app.exception_handler(IntegrityError)
+async def database_exception_handler(_request: Request, exc: IntegrityError):
+    """Handle SQLAlchemy database integrity constraint violations globally.
+
+    Intercepts IntegrityError exceptions (e.g., unique constraint violations,
+    foreign key constraints) and returns a properly formatted JSON error response.
+    This provides consistent error handling for database constraint violations
+    across the entire application.
+
+    Args:
+        _request: The FastAPI request object that triggered the database error.
+                  (Unused but required by FastAPI's exception handler interface)
+        exc: The SQLAlchemy IntegrityError exception containing constraint
+             violation details.
+
+    Returns:
+        JSONResponse: A 409 Conflict response with formatted database error details.
+
+    Examples:
+        >>> from sqlalchemy.exc import IntegrityError
+        >>> from fastapi import Request
+        >>> import asyncio
+        >>>
+        >>> # Create a mock integrity error
+        >>> mock_error = IntegrityError("statement", {}, Exception("duplicate key"))
+        >>> result = asyncio.run(database_exception_handler(None, mock_error))
+        >>> result.status_code
+        409
+        >>> # Verify ErrorFormatter.format_database_error is called
+        >>> hasattr(result, 'body')
+        True
+    """
+    return ORJSONResponse(status_code=409, content=ErrorFormatter.format_database_error(exc))
+
+
+@app.exception_handler(ContentSizeError)
+async def content_size_exception_handler(_request: Request, exc: ContentSizeError):
+    """Handle content size limit violations globally.
+
+    Args:
+        _request: The incoming request (unused, required by FastAPI handler interface).
+        exc: The ContentSizeError with actual_size, max_size, and content_type.
+
+    Returns:
+        ORJSONResponse: A 413 Payload Too Large response with structured error details.
+    """
+    return ORJSONResponse(status_code=413, content={"detail": {"error": f"{exc.content_type} size limit exceeded", "message": str(exc), "actual_size": exc.actual_size, "max_size": exc.max_size}})
+
+
+# RFC 9110 §5.6.2 'token' pattern for header field names:
+#   token = 1*tchar
+#   tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*"
+#           / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+#           / DIGIT / ALPHA
+_RFC9110_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def _validate_http_headers(headers: dict[str, str]) -> Optional[dict[str, str]]:
+    """Validate headers according to RFC 9110.
+
+    Args:
+        headers: dict of headers
+
+    Returns:
+        Optional[dict[str, str]]: dictionary of valid headers
+
+    Rules enforced:
+      - Header name must match RFC 9110 'token'.
+      - No whitespace before colon (enforced by dictionary usage).
+      - Header value must not contain CTL characters (0x00–0x1F, 0x7F),
+        except SP (0x20) and HTAB (0x09) which are allowed.
+    """
+    validated: dict[str, str] = {}
+    for key, value in headers.items():
+        # Validate header name (RFC 9110 token)
+        if not _RFC9110_TOKEN_RE.match(key):
+            logger.warning(f"Invalid header name: {key}")
+            continue
+        # RFC 9110: Reject CTLs (0x00–0x1F, 0x7F). Allow SP (0x20) and HTAB (0x09).
+        valid = True
+        for ch in value:
+            code = ord(ch)
+            if (0 <= code <= 31 or code == 127) and code not in (9, 32):
+                valid = False
+                break
+        if not valid:
+            logger.warning(f"Header value contains invalid characters: {key}")
+            continue
+        validated[key] = value
+    return validated if validated else None
+
+
+@app.exception_handler(PluginViolationError)
+async def plugin_violation_exception_handler(_request: Request, exc: PluginViolationError):
+    """Handle plugins violations globally.
+
+    Intercepts PluginViolationError exceptions (e.g., OPA policy violation) and returns a properly formatted JSON error response.
+    This provides consistent error handling for plugin violation across the entire application.
+
+    Args:
+        _request: The FastAPI request object that triggered the database error.
+                  (Unused but required by FastAPI's exception handler interface)
+        exc: The PluginViolationError exception containing constraint
+             violation details.
+
+    Returns:
+        JSONResponse: A response with error details in JSON-RPC format.
+                     Uses HTTP status code from violation if present (e.g., 429 for rate limiting),
+                     otherwise defaults to 200 for JSON-RPC compliance.
+
+    Examples:
+        >>> from mcpgateway.plugins.framework import PluginViolationError
+        >>> from mcpgateway.plugins.framework.models import PluginViolation
+        >>> from fastapi import Request
+        >>> import asyncio
+        >>> import json
+        >>>
+        >>> # Create a plugin violation error
+        >>> mock_error = PluginViolationError(message="plugin violation",violation = PluginViolation(
+        ...     reason="Invalid input",
+        ...     description="The input contains prohibited content",
+        ...     code="PROHIBITED_CONTENT",
+        ...     details={"field": "message", "value": "test"}
+        ... ))
+        >>> result = asyncio.run(plugin_violation_exception_handler(None, mock_error))
+        >>> result.status_code
+        422
+        >>> content = orjson.loads(result.body.decode())
+        >>> content["error"]["code"]
+        -32602
+        >>> "Plugin Violation:" in content["error"]["message"]
+        True
+        >>> content["error"]["data"]["plugin_error_code"]
+        'PROHIBITED_CONTENT'
+    """
+    policy_violation = exc.violation.model_dump() if exc.violation else {}
+    message = exc.violation.description if exc.violation else "A plugin violation occurred."
+    policy_violation["message"] = exc.message
+    status_code = exc.violation.mcp_error_code if exc.violation and exc.violation.mcp_error_code else -32602
+    violation_details: dict[str, Any] = {}
+    http_status = 200
+    if exc.violation:
+        if exc.violation.description:
+            violation_details["description"] = exc.violation.description
+        if exc.violation.details:
+            violation_details["details"] = exc.violation.details
+        if exc.violation.code:
+            violation_details["plugin_error_code"] = exc.violation.code
+        if exc.violation.plugin_name:
+            violation_details["plugin_name"] = exc.violation.plugin_name
+
+        # Use HTTP status code from violation if present (e.g., 429 for rate limiting)
+        http_status = exc.violation.http_status_code if exc.violation.http_status_code else None
+        if http_status and not VALID_HTTP_STATUS_CODES.get(http_status):
+            logger.warning(f"Invalid HTTP status code {http_status} from violation, defaulting to 200")
+            http_status = None
+        if not http_status:
+            logger.debug("Using Plugin violation code mapping for lack of http_status_code")
+            mapping: Optional[PluginViolationCode] = PLUGIN_VIOLATION_CODE_MAPPING.get(exc.violation.code) if exc.violation.code else None
+            if not mapping:
+                http_status = 200
+            else:
+                http_status = mapping.code
+
+    json_rpc_error = PydanticJSONRPCError(code=status_code, message="Plugin Violation: " + message, data=violation_details)
+
+    # Collect HTTP headers from violation if present
+    headers = exc.violation.http_headers if exc.violation and exc.violation.http_headers else None
+
+    response = ORJSONResponse(status_code=http_status, content={"error": json_rpc_error.model_dump()})
+    if headers:
+        validated_headers = _validate_http_headers(headers)
+        if validated_headers:
+            response.headers.update(validated_headers)
+    return response
+
+
+@app.exception_handler(PluginError)
+async def plugin_exception_handler(_request: Request, exc: PluginError):
+    """Handle plugins errors globally.
+
+    Intercepts PluginError exceptions and returns a properly formatted JSON error response.
+    This provides consistent error handling for plugin error across the entire application.
+
+    Args:
+        _request: The FastAPI request object that triggered the database error.
+                  (Unused but required by FastAPI's exception handler interface)
+        exc: The PluginError exception containing constraint
+             violation details.
+
+    Returns:
+        JSONResponse: A 200 response with error details in JSON-RPC format.
+
+    Examples:
+        >>> from mcpgateway.plugins.framework import PluginError
+        >>> from mcpgateway.plugins.framework.models import PluginErrorModel
+        >>> from fastapi import Request
+        >>> import asyncio
+        >>> import json
+        >>>
+        >>> # Create a plugin error
+        >>> mock_error = PluginError(error = PluginErrorModel(
+        ...     message="plugin error",
+        ...     code="timeout",
+        ...     plugin_name="abc",
+        ...     details={"field": "message", "value": "test"}
+        ... ))
+        >>> result = asyncio.run(plugin_exception_handler(None, mock_error))
+        >>> result.status_code
+        200
+        >>> content = orjson.loads(result.body.decode())
+        >>> content["error"]["code"]
+        -32603
+        >>> "Plugin Error:" in content["error"]["message"]
+        True
+        >>> content["error"]["data"]["plugin_error_code"]
+        'timeout'
+        >>> content["error"]["data"]["plugin_name"]
+        'abc'
+    """
+    message = exc.error.message if exc.error else "A plugin error occurred."
+    status_code = exc.error.mcp_error_code if exc.error else -32603
+    error_details: dict[str, Any] = {}
+    if exc.error:
+        if exc.error.details:
+            error_details["details"] = exc.error.details
+        if exc.error.code:
+            error_details["plugin_error_code"] = exc.error.code
+        if exc.error.plugin_name:
+            error_details["plugin_name"] = exc.error.plugin_name
+    json_rpc_error = PydanticJSONRPCError(code=status_code, message="Plugin Error: " + message, data=error_details)
+    return ORJSONResponse(status_code=200, content={"error": json_rpc_error.model_dump()})
+
+
+@app.exception_handler(ContentTypeError)
+async def content_type_exception_handler(_request: Request, exc: ContentTypeError):
+    """Handle MIME type validation failures globally.
+
+    Args:
+        _request: The incoming request (unused, required by FastAPI handler interface).
+        exc: The ContentTypeError with mime_type and allowed_types.
+
+    Returns:
+        ORJSONResponse: A 415 Unsupported Media Type response with error details.
+    """
+    return ORJSONResponse(
+        status_code=415,
+        content={
+            "detail": {
+                "error": "Unsupported MIME type",
+                "message": str(exc),
+                "mime_type": exc.mime_type,
+                "allowed_types": exc.allowed_types[:5],  # Limit to first 5
+            }
+        },
+    )
+
+
+def _normalize_scope_path(scope_path: str, root_path: str) -> str:
+    """Strip ``root_path`` prefix from *scope_path* when a reverse proxy forwards the full path.
+
+    Returns the route-only path (e.g. ``"/qa/gateway/docs"`` -> ``"/docs"``).
+    A ``root_path`` of ``"/"`` is ignored to avoid stripping the leading slash
+    from every path.  Trailing slashes on *root_path* are stripped before
+    comparison so that ``"/qa/gateway/"`` is handled identically to
+    ``"/qa/gateway"``.
+
+    Args:
+        scope_path: The full path from the request scope.
+        root_path: The root path prefix to be stripped.
+
+    Returns:
+        The normalized path with the root_path prefix removed.
+    """
+    if root_path and len(root_path) > 1:
+        root_path = root_path.rstrip("/")
+    if root_path and len(root_path) > 1 and scope_path.startswith(root_path):
+        rest = scope_path[len(root_path) :]
+        # Ensure we matched a full path segment, not a partial prefix
+        # e.g. root_path="/app" must not strip from "/application/admin"
+        if not rest or rest[0] == "/":
+            return rest or "/"
+    return scope_path
+
+
+class DocsAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to protect FastAPI's auto-generated documentation routes
+    (/docs, /redoc, and /openapi.json) using Bearer token authentication.
+
+    If a request to one of these paths is made without a valid token,
+    the request is rejected with a 401 or 403 error.
+
+    Note:
+        OPTIONS requests are exempt from authentication to support CORS preflight
+        as per RFC 7231 Section 4.3.7 (OPTIONS must not require authentication).
+
+    Note:
+        When DOCS_ALLOW_BASIC_AUTH is enabled, Basic Authentication
+        is also accepted using BASIC_AUTH_USER and BASIC_AUTH_PASSWORD credentials.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        """
+        Intercepts incoming requests to check if they are accessing protected documentation routes.
+        If so, it requires a valid Bearer token; otherwise, it allows the request to proceed.
+
+        Args:
+            request (Request): The incoming HTTP request.
+            call_next (Callable): The function to call the next middleware or endpoint.
+
+        Returns:
+            Response: Either the standard route response or a 401/403 error response.
+
+        Examples:
+            >>> import asyncio
+            >>> from unittest.mock import Mock, AsyncMock, patch
+            >>> from fastapi import HTTPException
+            >>> from fastapi.responses import JSONResponse
+            >>>
+            >>> # Test unprotected path - should pass through
+            >>> middleware = DocsAuthMiddleware(None)
+            >>> request = Mock()
+            >>> request.url.path = "/api/tools"
+            >>> request.scope = {"path": "/api/tools", "root_path": ""}
+            >>> request.method = "GET"
+            >>> request.headers.get.return_value = None
+            >>> call_next = AsyncMock(return_value="response")
+            >>>
+            >>> result = asyncio.run(middleware.dispatch(request, call_next))
+            >>> result
+            'response'
+            >>>
+            >>> # Test that middleware checks protected paths
+            >>> request.url.path = "/docs"
+            >>> isinstance(middleware, DocsAuthMiddleware)
+            True
+        """
+        protected_paths = ["/docs", "/redoc", "/openapi.json"]
+
+        # Allow OPTIONS requests to pass through for CORS preflight (RFC 7231)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Get path from scope to handle root_path correctly
+        scope_path = request.scope.get("path", request.url.path)
+        root_path = resolve_root_path(request)
+        scope_path = _normalize_scope_path(scope_path, root_path)
+
+        is_protected = any(scope_path.startswith(p) for p in protected_paths)
+
+        if is_protected:
+            try:
+                token = request.headers.get("Authorization")
+                cookie_token = request.cookies.get("jwt_token")
+
+                # Use dedicated docs authentication that bypasses global auth settings
+                await require_docs_auth_override(token, cookie_token)
+            except HTTPException as e:
+                return ORJSONResponse(status_code=e.status_code, content={"detail": e.detail}, headers=e.headers if e.headers else None)
+
+        # Proceed to next middleware or route
+        return await call_next(request)
+
+
+class AdminAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to protect Admin UI routes (/admin/*) requiring admin privileges.
+
+    Exempts login-related paths and static assets:
+    - /admin/login - login page
+    - /admin/logout - logout action
+    - /admin/forgot-password - self-service password reset request page
+    - /admin/reset-password/* - self-service password reset completion page
+    - /admin/static/* - static assets
+
+    All other /admin/* routes require the user to be authenticated AND be an admin.
+    Non-admin authenticated users receive a 403 Forbidden response.
+
+    Note: This middleware respects the auth_required setting. When auth_required=False
+    (typically in test environments), the middleware allows requests to pass through
+    and relies on endpoint-level authentication which can be mocked in tests.
+    """
+
+    # Public paths under /admin that do not require prior authentication.
+    EXEMPT_PATHS = [
+        "/admin/login",
+        "/admin/logout",
+        "/admin/forgot-password",
+        "/admin/reset-password",
+        "/admin/static",
+    ]
+
+    @staticmethod
+    def _error_response(request: Request, root_path: str, status_code: int, detail: str, error_param: str = None):
+        """Return appropriate error response based on request Accept header.
+
+        Args:
+            request: The incoming HTTP request.
+            root_path: The root path prefix for the application.
+            status_code: HTTP status code for JSON responses.
+            detail: Error message detail.
+            error_param: Optional error parameter for login redirect URL.
+
+        Returns:
+            Response with HX-Redirect for HTMX requests, RedirectResponse for HTML requests, ORJSONResponse for API requests.
+        """
+        accept_header = request.headers.get("accept", "")
+        is_htmx = request.headers.get("hx-request") == "true"
+        if "text/html" in accept_header or is_htmx:
+            login_url = f"{root_path}/admin/login" if root_path else "/admin/login"
+            if error_param:
+                login_url = f"{login_url}?error={error_param}"
+            if is_htmx:
+                return Response(status_code=200, headers={"HX-Redirect": login_url})
+            return RedirectResponse(url=login_url, status_code=302)
+        return ORJSONResponse(status_code=status_code, content={"detail": detail})
+
+    async def dispatch(self, request: Request, call_next):  # pylint: disable=too-many-return-statements
+        """
+        Check admin privileges for admin routes.
+
+        Args:
+            request (Request): The incoming HTTP request.
+            call_next (Callable): The function to call the next middleware or endpoint.
+
+        Returns:
+            Response: Either the standard route response or a 401/403 error response.
+        """
+        # Skip admin auth check if auth is not required (e.g., test environments)
+        # This allows tests to mock authentication at the dependency level
+        if not settings.auth_required:
+            return await call_next(request)
+
+        # Get path from scope to handle root_path correctly
+        scope_path = request.scope.get("path", request.url.path)
+        root_path = resolve_root_path(request)
+        scope_path = _normalize_scope_path(scope_path, root_path)
+
+        # Allow OPTIONS requests for CORS preflight (RFC 7231)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Check if this is an admin route
+        is_admin_route = scope_path.startswith("/admin")
+
+        if not is_admin_route:
+            return await call_next(request)
+
+        # Check if path is exempt (login, logout, static)
+        is_exempt = any(scope_path.startswith(p) for p in self.EXEMPT_PATHS)
+        if is_exempt:
+            return await call_next(request)
+
+        # For protected admin routes, verify admin status
+        try:
+            token = request.headers.get("Authorization")
+            cookie_token = request.cookies.get("jwt_token") or request.cookies.get("access_token")
+
+            # Extract token from header or cookie
+            jwt_token = None
+            if cookie_token:
+                jwt_token = cookie_token
+            elif token and token.startswith("Bearer "):
+                jwt_token = token.split(" ", 1)[1]
+
+            username = None
+            token_teams = None
+
+            if jwt_token:
+                # Try JWT authentication first
+                try:
+                    payload = await verify_jwt_token(jwt_token)
+                    username = payload.get("sub") or payload.get("email")
+
+                    if not username:
+                        return ORJSONResponse(status_code=401, content={"detail": "Invalid token"})
+
+                    # Check if token is revoked (if JTI exists)
+                    jti = payload.get("jti")
+                    if jti:
+                        try:
+                            is_revoked = await asyncio.to_thread(_check_token_revoked_sync, jti)
+                            if is_revoked:
+                                logger.warning(f"Admin access denied for revoked token: {SecurityValidator.sanitize_log_message(str(username))}")
+                                return self._error_response(request, root_path, 401, "Token has been revoked", "token_revoked")
+                        except Exception as revoke_error:
+                            logger.warning(f"Token revocation check failed: {revoke_error}")
+                            # Continue - don't fail auth if revocation check fails
+
+                    # SECURITY: Apply token scope semantics for admin paths.
+                    # Use the same token_use-aware resolution as auth.py.
+                    token_use = payload.get("token_use")
+                    if token_use == "session":  # nosec B105 - Not a password; token_use is a JWT claim type
+                        is_admin = payload.get("is_admin", False) or payload.get("user", {}).get("is_admin", False)
+                        token_teams = await resolve_session_teams(payload, username, {"is_admin": is_admin})
+                    else:
+                        # API token or legacy path: embedded teams claim semantics
+                        token_teams = normalize_token_teams(payload)
+                except Exception:
+                    # JWT validation failed, try API token
+                    token_hash = hashlib.sha256(jwt_token.encode()).hexdigest()
+                    api_token_info = await asyncio.to_thread(_lookup_api_token_sync, token_hash)
+
+                    if api_token_info:
+                        if api_token_info.get("expired"):
+                            return ORJSONResponse(status_code=401, content={"detail": "API token expired"})
+                        if api_token_info.get("revoked"):
+                            return ORJSONResponse(status_code=401, content={"detail": "API token has been revoked"})
+                        username = api_token_info["user_email"]
+                        logger.debug(f"Admin auth via API token: {SecurityValidator.sanitize_log_message(str(username))}")
+
+            # NOTE: Basic auth is NOT supported for admin UI endpoints.
+            # While AdminAuthMiddleware could validate Basic credentials, the admin
+            # endpoints use get_current_user_with_permissions which requires JWT tokens.
+            # Supporting Basic auth would require passing auth context to routes,
+            # which increases complexity and attack surface. Use JWT or API tokens instead.
+
+            if not username and is_proxy_auth_trust_active(settings):
+                # Proxy authentication path (when MCP client auth is disabled and proxy auth is trusted)
+                proxy_user = request.headers.get(settings.proxy_user_header)
+                if proxy_user:
+                    username = proxy_user
+                    logger.debug(f"Admin auth via proxy header: {SecurityValidator.sanitize_log_message(str(username))}")
+
+            if not username:
+                # No authentication method succeeded - redirect to login or return 401
+                return self._error_response(request, root_path, 401, "Authentication required")
+
+            # SECURITY: Public-only tokens (teams=[]) never grant admin-path access,
+            # even for admin identities. Admin bypass requires explicit teams=null + is_admin=true.
+            if token_teams is not None and len(token_teams) == 0:
+                logger.warning(f"Admin access denied for public-only token: {SecurityValidator.sanitize_log_message(str(username))}")
+                return self._error_response(request, root_path, 403, "Admin privileges required", "admin_required")
+
+            # Check if user exists, is active, and has admin permissions
+            db = next(get_db())
+            try:
+                auth_service = EmailAuthService(db)
+                user = await auth_service.get_user_by_email(username)
+
+                if not user:
+                    # Platform admin bootstrap (when REQUIRE_USER_IN_DB=false)
+                    platform_admin_email = getattr(settings, "platform_admin_email", "admin@example.com")
+                    if not settings.require_user_in_db and username == platform_admin_email:
+                        logger.info(f"Platform admin bootstrap authentication for {SecurityValidator.sanitize_log_message(str(username))}")
+                        # Allow platform admin through - they have implicit admin privileges
+                    else:
+                        return self._error_response(request, root_path, 401, "User not found")
+                else:
+                    # User exists in DB - check active status
+                    if not user.is_active:
+                        logger.warning(f"Admin access denied for disabled user: {SecurityValidator.sanitize_log_message(str(username))}")
+                        return self._error_response(request, root_path, 403, "Account is disabled", "account_disabled")
+
+                    # Check if user has admin permissions (either is_admin flag OR admin.* RBAC permissions)
+                    # This allows granular admin access for users with specific admin permissions.
+                    # When the request is team-scoped (?team_id=...), include team-scoped roles
+                    # so that developer/viewer roles with admin.dashboard can access the UI.
+                    permission_service = PermissionService(db)
+                    request_team_id = request.query_params.get("team_id")
+                    # Normalize to hex so hyphenated UUIDs match DB-stored hex IDs.
+                    # Fall back to raw value for non-UUID team IDs (e.g. from legacy tokens).
+                    if request_team_id:
+                        try:
+                            request_team_id = uuid.UUID(request_team_id).hex
+                        except (ValueError, AttributeError):
+                            pass  # keep raw value for non-UUID token_teams
+                    # Only trust team_id if it is in the user's DB-resolved teams
+                    validated_team_id = request_team_id if (token_teams and request_team_id and request_team_id in token_teams) else None
+                    has_admin_access = await permission_service.has_admin_permission(username, team_id=validated_team_id, token_teams=token_teams)
+                    if not has_admin_access:
+                        logger.warning(f"Admin access denied for user without admin permissions: {SecurityValidator.sanitize_log_message(str(username))}")
+                        return self._error_response(request, root_path, 403, "Admin privileges required", "admin_required")
+            finally:
+                db.close()
+
+        except HTTPException as e:
+            return self._error_response(request, root_path, e.status_code, e.detail)
+        except Exception as e:
+            logger.error(f"Admin auth middleware error: {e}")
+            return ORJSONResponse(status_code=500, content={"detail": "Authentication error"})
+
+        # Proceed to next middleware or route
+        return await call_next(request)
+
+
+class MCPPathRewriteMiddleware:
+    """
+    Middleware that rewrites paths ending with '/mcp' to '/mcp/', after performing authentication.
+
+    - Rewrites paths like '/servers/<server_id>/mcp' to '/mcp/'.
+    - Only paths ending with '/mcp' or '/mcp/' (but not exactly '/mcp' or '/mcp/') are rewritten.
+    - Authentication is performed before any path rewriting.
+    - If authentication fails, the request is not processed further.
+    - All other requests are passed through without change.
+    - Routes through the middleware stack (including CORSMiddleware) for proper CORS preflight handling.
+
+    Attributes:
+        application (Callable): The next ASGI application to process the request.
+    """
+
+    def __init__(self, application, dispatch=None):
+        """
+        Initialize the middleware with the ASGI application.
+
+        Args:
+            application (Callable): The next ASGI application to handle the request.
+            dispatch (Callable, optional): An optional dispatch function for additional middleware processing.
+
+        Example:
+            >>> import asyncio
+            >>> from unittest.mock import AsyncMock, patch
+            >>> app_mock = AsyncMock()
+            >>> middleware = MCPPathRewriteMiddleware(app_mock)
+            >>> isinstance(middleware.application, AsyncMock)
+            True
+        """
+        self.application = application
+        self.dispatch = dispatch  # this can be TokenScopingMiddleware
+
+    async def __call__(self, scope, receive, send):
+        """
+        Intercept and potentially rewrite the incoming HTTP request path.
+
+        Args:
+            scope (dict): The ASGI connection scope.
+            receive (Callable): Awaitable that yields events from the client.
+            send (Callable): Awaitable used to send events to the client.
+
+        Examples:
+            >>> import asyncio
+            >>> from unittest.mock import AsyncMock, patch
+            >>> app_mock = AsyncMock()
+            >>> middleware = MCPPathRewriteMiddleware(app_mock)
+
+            >>> # Test path rewriting for /servers/123/mcp
+            >>> scope = { "type": "http", "path": "/servers/123/mcp", "headers": [(b"host", b"example.com")] }
+            >>> receive = AsyncMock()
+            >>> send = AsyncMock()
+            >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
+            ...     asyncio.run(middleware(scope, receive, send))
+            >>> scope["path"]
+            '/mcp/'
+            >>> app_mock.assert_called()
+
+            >>> # Test regular path (no rewrite)
+            >>> scope = { "type": "http","path": "/tools","headers": [(b"host", b"example.com")] }
+            >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
+            ...     asyncio.run(middleware(scope, receive, send))
+            ...     scope["path"]
+            '/tools'
+        """
+        if scope["type"] != "http":
+            await self.application(scope, receive, send)
+            return
+
+        # If a dispatch (request middleware) is provided, adapt it
+        if self.dispatch is not None:
+            request = starletteRequest(scope, receive=receive)
+
+            async def call_next(_req: starletteRequest) -> starletteResponse:
+                """
+                Handles the next request in the middleware chain by calling a streamable HTTP response.
+
+                Args:
+                    _req (starletteRequest): The incoming request to be processed.
+
+                Returns:
+                    starletteResponse: A response generated from the streamable HTTP call.
+                """
+                return await self._call_streamable_http(scope, receive, send)
+
+            response = await self.dispatch(request, call_next)
+
+            if response is None:
+                # Either the dispatch handled the response itself,
+                # or it blocked the request. Just return.
+                return
+
+            await response(scope, receive, send)
+            return
+
+        # Otherwise, just continue as normal
+        await self._call_streamable_http(scope, receive, send)
+
+    async def _call_streamable_http(self, scope, receive, send):
+        """
+        Handles the streamable HTTP request after authentication and path rewriting.
+
+        If auth succeeds and path ends with /mcp, rewrites to /mcp/ and calls self.application
+        (continuing through middleware stack including CORSMiddleware).
+
+        Args:
+            scope (dict): The ASGI connection scope containing request metadata.
+            receive (Callable): The function to receive events from the client.
+            send (Callable): The function to send events to the client.
+
+        Example:
+            >>> import asyncio
+            >>> from unittest.mock import AsyncMock, patch
+            >>> app_mock = AsyncMock()
+            >>> middleware = MCPPathRewriteMiddleware(app_mock)
+            >>> scope = {"type": "http", "path": "/servers/123/mcp"}
+            >>> receive = AsyncMock()
+            >>> send = AsyncMock()
+            >>> with patch('mcpgateway.main.streamable_http_auth', return_value=True):
+            ...     asyncio.run(middleware._call_streamable_http(scope, receive, send))
+            >>> app_mock.assert_called_once_with(scope, receive, send)
+        """
+        # Auth check first
+        auth_ok = await streamable_http_auth(scope, receive, send)
+        if not auth_ok:
+            return
+
+        original_path = scope.get("path", "")
+        scope["modified_path"] = original_path
+
+        # Strip root_path prefix before pattern matching.
+        # In reverse proxy deployments, scope["path"] may contain the full path
+        # including the proxy prefix (e.g., "/dev/mcp-gateway/service/gateway/servers/123/mcp").
+        # We need to strip this prefix to correctly match the /servers/ pattern.
+        root_path = (scope.get("root_path") or settings.app_root_path or "").rstrip("/")
+        app_path = _normalize_scope_path(original_path, root_path)
+
+        # Update modified_path to the app-relative path (without root_path prefix).
+        # This ensures streamablehttp_transport can extract server_id via regex (#4266).
+        scope["modified_path"] = app_path
+
+        # Skip rewriting for well-known URIs (RFC 9728 OAuth metadata, etc.)
+        # These paths may end with /mcp but should not be rewritten to the MCP transport
+        if not app_path.startswith("/.well-known/"):
+            if (app_path.endswith("/mcp") and app_path != "/mcp") or (app_path.endswith("/mcp/") and app_path != "/mcp/"):
+                # SECURITY: Only rewrite recognised MCP paths — /servers/{id}/mcp.
+                # Arbitrary prefixes (e.g. /foo/mcp) must NOT be rewritten to
+                # /mcp/ as that would expose the global MCP transport under
+                # undocumented aliases, broadening the externally reachable
+                # route surface.
+                if app_path.startswith("/servers/"):
+                    # Validate that a non-empty server_id segment is present.
+                    # Without this check, paths like /servers//mcp (empty ID)
+                    # would be rewritten and silently fall through (#3891).
+                    _srv_match = re.match(r"/servers/([^/]+)/mcp", app_path)
+                    if not _srv_match:
+                        response = ORJSONResponse({"detail": "Invalid server identifier"}, status_code=404)
+                        await response(scope, receive, send)
+                        return
+                else:
+                    # Not a /servers/ path — do not rewrite, pass through
+                    await self.application(scope, receive, send)
+                    return
+                # Rewrite to /mcp/ and continue through middleware (lets CORSMiddleware handle preflight)
+                # Preserve root_path prefix when rewriting
+                scope["path"] = f"{root_path}/mcp/" if root_path else "/mcp/"
+                await self.application(scope, receive, send)
+                return
+        await self.application(scope, receive, send)
+
+
+# Configure CORS with environment-aware origins
+cors_origins = list(settings.allowed_origins) if settings.allowed_origins else []
+
+# Ensure we never use wildcard in production
+if settings.environment == "production" and not cors_origins:
+    logger.warning("No CORS origins configured for production environment. CORS will be disabled.")
+    cors_origins = []
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Content-Length", "X-Request-ID", "X-Password-Change-Required"],
+    max_age=600,  # Cache preflight requests for 10 minutes
+)
+
+# Add response compression middleware (Brotli, Zstd, GZip)
+# Automatically negotiates compression algorithm based on client Accept-Encoding header
+# Priority: Brotli (best compression) > Zstd (fast) > GZip (universal fallback)
+# Only compress responses larger than minimum_size to avoid overhead
+# NOTE: When json_response_enabled=False (SSE mode), /mcp paths are excluded from
+# compression to prevent buffering/breaking of streaming responses. See middleware/compression.py.
+if settings.compression_enabled:
+    app.add_middleware(
+        SSEAwareCompressMiddleware,
+        minimum_size=settings.compression_minimum_size,
+        gzip_level=settings.compression_gzip_level,
+        brotli_quality=settings.compression_brotli_quality,
+        zstd_level=settings.compression_zstd_level,
+    )
+    logger.info(
+        f"🗜️  Response compression enabled (SSE-aware): minimum_size={settings.compression_minimum_size}B, "
+        f"gzip_level={settings.compression_gzip_level}, "
+        f"brotli_quality={settings.compression_brotli_quality}, "
+        f"zstd_level={settings.compression_zstd_level}"
+    )
+else:
+    logger.info("🚫 Response compression disabled")
+
+# Add security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Add validation middleware if explicitly enabled
+if settings.validation_middleware_enabled:
+    app.add_middleware(ValidationMiddleware)
+    logger.info("🔒 Input validation and output sanitization middleware enabled")
+else:
+    logger.info("🔒 Input validation and output sanitization middleware disabled")
+
+# Add MCP Protocol Version validation middleware (validates MCP-Protocol-Version header)
+app.add_middleware(MCPProtocolVersionMiddleware)
+
+# Add token scoping middleware (only when email auth is enabled)
+if settings.email_auth_enabled:
+    app.add_middleware(BaseHTTPMiddleware, dispatch=token_scoping_middleware)
+    # Add streamable HTTP middleware for /mcp routes with token scoping
+    app.add_middleware(MCPPathRewriteMiddleware, dispatch=token_scoping_middleware)
+else:
+    # Add streamable HTTP middleware for /mcp routes
+    app.add_middleware(MCPPathRewriteMiddleware)
+
+# Add HTTP authentication hook middleware for plugins (before auth dependencies)
+# Middleware will get the global plugin manager at request time if factory exists
+app.add_middleware(HttpAuthMiddleware)
+
+# Add request logging middleware FIRST (always enabled for gateway boundary logging)
+# IMPORTANT: Must be registered BEFORE CorrelationIDMiddleware so it executes AFTER correlation ID is set
+# Gateway boundary logging (request_started/completed) runs regardless of log_requests setting
+# Detailed payload logging only runs if log_detailed_requests=True
+app.add_middleware(
+    RequestLoggingMiddleware,
+    enable_gateway_logging=True,
+    log_detailed_requests=settings.log_requests,
+    log_level=settings.log_level,
+    max_body_size=settings.log_detailed_max_body_size,
+    log_resolve_user_identity=settings.log_resolve_user_identity,
+    log_detailed_skip_endpoints=settings.log_detailed_skip_endpoints,
+    log_detailed_sample_rate=settings.log_detailed_sample_rate,
+)
+
+# Add custom DocsAuthMiddleware
+app.add_middleware(DocsAuthMiddleware)
+
+# Add AdminAuthMiddleware to protect admin routes (requires admin privileges)
+# This ensures all /admin/* routes (except login/logout) require admin status
+app.add_middleware(AdminAuthMiddleware)
+
+# Trust all proxies (or lock down with a list of host patterns)
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+# Add correlation ID middleware if enabled
+# Note: Registered AFTER RequestLoggingMiddleware so correlation ID is available when RequestLoggingMiddleware executes
+if settings.correlation_id_enabled:
+    app.add_middleware(CorrelationIDMiddleware)
+    logger.info(f"✅ Correlation ID tracking enabled (header: {settings.correlation_id_header})")
+
+# Add authentication context middleware if security logging is enabled
+# This middleware extracts user context and logs security events (authentication attempts)
+# Note: This is independent of observability - security logging is always important
+if settings.security_logging_enabled:
+    # First-Party
+    from mcpgateway.middleware.auth_middleware import AuthContextMiddleware
+
+    app.add_middleware(AuthContextMiddleware)
+    logger.info("🔐 Authentication context middleware enabled - logging security events")
+else:
+    logger.info("🔐 Security event logging disabled")
+
+# Add token usage logging middleware
+# This tracks API token usage for analytics and security monitoring
+# Note: Runs after AuthContextMiddleware so request.state.auth_method is available
+if settings.token_usage_logging_enabled:
+    # First-Party
+    from mcpgateway.middleware.token_usage_middleware import TokenUsageMiddleware  # noqa: E402
+
+    app.add_middleware(TokenUsageMiddleware)
+    logger.info("📊 Token usage logging middleware enabled - tracking API token usage")
+else:
+    logger.info("📊 Token usage logging middleware disabled")
+
+# Add observability middleware if enabled
+# Note: Middleware runs in REVERSE order (last added runs first)
+# If AuthContextMiddleware is already registered, ObservabilityMiddleware wraps it
+# Execution order will be: AuthContext -> Observability -> Request Handler
+# Wire observability adapter into the plugin manager when observability is enabled
+if settings.observability_enabled:
+    # First-Party
+    from mcpgateway.middleware.observability_middleware import ObservabilityMiddleware
+    from mcpgateway.services.observability_service import ObservabilityService
+
+    _service = ObservabilityService()
+    app.add_middleware(ObservabilityMiddleware, enabled=True, service=_service)
+    # Plugin observability adapter will be set in lifespan after plugin_manager is initialized
+    logger.info("🔍 Observability middleware enabled - tracing include-listed requests")
+else:
+    logger.info("🔍 Observability middleware disabled")
+
+if otel_tracing_enabled():
+    app.add_middleware(OpenTelemetryRequestMiddleware)
+    logger.info("🧵 OTEL request tracing middleware enabled for transport request roots")
+else:
+    logger.info("🧵 OTEL request tracing middleware disabled")
+
+# Add OTEL baggage middleware after request tracing middleware so it executes first
+# and attaches baggage before the request-root span is created.
+if settings.otel_baggage_enabled and otel_tracing_enabled():
+    # First-Party
+    from mcpgateway.middleware.baggage_middleware import BaggageMiddleware
+
+    app.add_middleware(BaggageMiddleware)
+    logger.info("🧳 OTEL baggage middleware enabled for HTTP header extraction")
+elif settings.otel_baggage_enabled and not otel_tracing_enabled():
+    logger.warning("🧳 OTEL baggage enabled but tracing disabled - baggage will not be captured in spans")
+else:
+    logger.debug("🧳 OTEL baggage middleware disabled")
+
+
+# Database query logging middleware (for N+1 detection)
+if settings.db_query_log_enabled:
+    # First-Party
+    from mcpgateway.db import engine
+    from mcpgateway.middleware.db_query_logging import setup_query_logging
+
+    setup_query_logging(app, engine)
+    logger.info(f"📊 Database query logging enabled - logs: {settings.db_query_log_file}")
+else:
+    logger.debug("📊 Database query logging disabled (enable with DB_QUERY_LOG_ENABLED=true)")
+
+# Set up Jinja2 templates and store in app state for later use
+# auto_reload=False in production prevents re-parsing templates on each request (performance)
+jinja_env = Environment(
+    loader=FileSystemLoader(str(settings.templates_dir)),
+    autoescape=True,
+    auto_reload=settings.templates_auto_reload,
+)
+
+
+# Add custom filter to decode HTML entities for backward compatibility with old database records
+# that were stored with HTML entities (e.g., &#x27; instead of ')
+# NOTE: This filter can be removed after all deployments have run the c1c2c3c4c5c6 migration,
+# which decodes all existing HTML entities in the database. After that migration, this filter
+# becomes a no-op since new data is stored without HTML encoding.
+def decode_html_entities(value: str) -> str:
+    """Decode HTML entities in strings for display.
+
+    This filter handles legacy data that was stored with HTML entities.
+    New data is stored without encoding, but this ensures old records display correctly.
+
+    TEMPORARY: Can be removed after c1c2c3c4c5c6 migration has been applied to all deployments.
+
+    Args:
+        value: String that may contain HTML entities
+
+    Returns:
+        String with HTML entities decoded to their original characters
+    """
+    if not value:
+        return value
+
+    return html.unescape(value)
+
+
+jinja_env.filters["decode_html"] = decode_html_entities
+
+
+def tojson_attr(value: object) -> str:
+    """JSON-encode a value for safe use inside double-quoted HTML attributes.
+
+    Unlike the built-in ``|tojson`` filter (which returns ``Markup``, bypassing
+    autoescape), this filter returns a plain ``str``.  Jinja2 autoescape then
+    HTML-encodes the ``"`` characters to ``&quot;``, keeping the enclosing
+    ``"``-delimited HTML attribute intact.  The browser decodes the entities
+    back to ``"`` before passing the value to the JS engine.
+
+    Use ``|tojson_attr`` for inline event handlers (``onclick``, ``onsubmit``).
+    Use the built-in ``|tojson`` for ``<script>`` blocks (where ``Markup`` is fine).
+
+    Args:
+        value: Any JSON-serialisable object.
+
+    Returns:
+        Plain string with JSON content (autoescape will HTML-encode it).
+    """
+    s = orjson.dumps(value, default=str).decode()
+    # Same HTML-safety replacements as Jinja2's htmlsafe_json_dumps,
+    # but we return a plain str so autoescape encodes the remaining `"`.
+    s = s.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e").replace("'", "\\u0027")
+    return s
+
+
+jinja_env.filters["tojson_attr"] = tojson_attr
+
+templates = Jinja2Templates(env=jinja_env)
+if not settings.templates_auto_reload:
+    logger.info("🎨 Template auto-reload disabled (production mode)")
+app.state.templates = templates
+
+# Plugin manager is obtained from factory at request time via get_plugin_manager()
+# No need to store in app state; routes will get it from the factory when needed
+
+# Plugin service will be initialized in lifespan after plugin manager is ready
+
+# Create API routers
+protocol_router = APIRouter(prefix="/protocol", tags=["Protocol"])
+tool_router = APIRouter(prefix="/tools", tags=["Tools"])
+resource_router = APIRouter(prefix="/resources", tags=["Resources"])
+prompt_router = APIRouter(prefix="/prompts", tags=["Prompts"])
+gateway_router = APIRouter(prefix="/gateways", tags=["Gateways"])
+root_router = APIRouter(prefix="/roots", tags=["Roots"])
+utility_router = APIRouter(tags=["Utilities"])
+server_router = APIRouter(prefix="/servers", tags=["Servers"])
+metrics_router = APIRouter(prefix="/metrics", tags=["Metrics"])
+tag_router = APIRouter(prefix="/tags", tags=["Tags"])
+export_import_router = APIRouter(tags=["Export/Import"])
+a2a_router = APIRouter(prefix="/a2a", tags=["A2A Agents"])
+
+# Basic Auth setup
+
+
+# Database dependency
+def get_db(request: Request = None):
+    """
+    Dependency function to provide a database session.
+
+    When observability is enabled, this reuses the session created by
+    ObservabilityMiddleware (stored in request.state.db) to avoid duplicate
+    session creation. When observability is disabled or the middleware hasn't
+    created a session, this creates its own session.
+
+    **Transaction Control**: This function ALWAYS controls transaction boundaries
+    (commit/rollback) regardless of whether it creates the session or reuses one
+    from middleware. This ensures predictable transaction semantics for route
+    handlers and maintains data integrity.
+
+    **Session Lifecycle**: Middleware manages session lifecycle (create/close)
+    while this function manages transactions (commit/rollback). This separation
+    of concerns prevents the transaction management violation described in #3731.
+
+    Commits the transaction on successful completion to avoid implicit rollbacks
+    for read-only operations. Rolls back explicitly on exception.
+
+    This function handles connection failures gracefully by invalidating broken
+    connections. When a connection is broken (e.g., due to PgBouncer timeout or
+    network issues), the rollback will fail. In this case, we invalidate the
+    session to ensure the broken connection is discarded from the pool rather
+    than being returned in a bad state.
+
+    Args:
+        request: Optional FastAPI request object (injected automatically)
+
+    Yields:
+        Session: A SQLAlchemy session object for interacting with the database.
+
+    Raises:
+        Exception: Re-raises any exception after rolling back the transaction.
+
+    Ensures:
+        - Transaction is committed on success (for both owned and reused sessions)
+        - Transaction is rolled back on error (for both owned and reused sessions)
+        - Session is closed only if created by this function (not if reused from middleware)
+        - Broken connections are invalidated to prevent pool corruption
+
+    Examples:
+        >>> # Test that get_db returns a generator
+        >>> db_gen = get_db()
+        >>> hasattr(db_gen, '__next__')
+        True
+        >>> # Test cleanup happens
+        >>> try:
+        ...     db = next(db_gen)
+        ...     type(db).__name__
+        ... finally:
+        ...     try:
+        ...         next(db_gen)
+        ...     except StopIteration:
+        ...         pass  # Expected - generator cleanup
+        'ResilientSession'
+    """
+    # Check if ObservabilityMiddleware already created a request-scoped session
+    # This eliminates duplicate session creation when observability is enabled (Issue #3467)
+    if request is not None and hasattr(request, "state") and hasattr(request.state, "db"):
+        db = request.state.db
+        if db is not None:
+            logger.debug(f"[GET_DB] Reusing session from middleware: {id(db)}")
+            # Yield the middleware's session. We control transactions, middleware controls lifecycle.
+            try:
+                yield db
+                # Commit on successful completion (only if transaction still active)
+                # The transaction can become inactive if an exception occurred during
+                # async context manager cleanup (e.g., CancelledError during MCP session teardown).
+                if db.is_active:
+                    db.commit()
+            except Exception:
+                try:
+                    # Always call rollback() in exception handler.
+                    # rollback() is safe to call even when is_active=False - it succeeds and
+                    # restores the session to a usable state. When is_active=False (e.g., after
+                    # IntegrityError), rollback() is actually REQUIRED to clear the failed state.
+                    # Skipping rollback when is_active=False would leave the session unusable.
+                    db.rollback()
+                except Exception:
+                    # Connection is broken - invalidate to remove from pool
+                    # This handles cases like PgBouncer query_wait_timeout where
+                    # the connection is dead and rollback itself fails
+                    try:
+                        db.invalidate()
+                    except Exception:
+                        pass  # nosec B110 - Best effort cleanup on connection failure
+                raise
+            # Don't close - middleware owns the session lifecycle
+            return
+
+    # Fallback: Create our own session (observability disabled or middleware didn't create one)
+    db = SessionLocal()
+    logger.debug(f"[GET_DB] DB session created: {id(db)}")
+    try:
+        yield db
+        # Only commit if the transaction is still active.
+        # The transaction can become inactive if an exception occurred during
+        # async context manager cleanup (e.g., CancelledError during MCP session teardown).
+        if db.is_active:
+            db.commit()
+    except Exception:
+        try:
+            # Always call rollback() in exception handler.
+            # rollback() is safe to call even when is_active=False - it succeeds and
+            # restores the session to a usable state. When is_active=False (e.g., after
+            # IntegrityError), rollback() is actually REQUIRED to clear the failed state.
+            # Skipping rollback when is_active=False would leave the session unusable.
+            db.rollback()
+        except Exception:
+            # Connection is broken - invalidate to remove from pool
+            # This handles cases like PgBouncer query_wait_timeout where
+            # the connection is dead and rollback itself fails
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass  # nosec B110 - Best effort cleanup on already-failed prompt bridge sessions
+
+
+async def require_valid_server(server_id: str, db: Session = Depends(get_db)) -> str:
+    """FastAPI dependency that validates a server_id exists in the database.
+
+    Provides a reusable, fail-closed guard for any server-scoped endpoint.
+    Uses the lightweight ``entity_exists()`` check — no eager loading.
+
+    Args:
+        server_id: Path parameter extracted by FastAPI.
+        db: Database session from the ``get_db`` dependency.
+
+    Returns:
+        The validated server_id string.
+
+    Raises:
+        HTTPException: 404 if the server does not exist, 503 on database errors.
+    """
+    try:
+        if not await server_service.entity_exists(db, server_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Server not found")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service unavailable — unable to verify server")
+    return server_id
+
+
+async def _read_request_json(request: Request) -> Any:
+    """Read JSON payload using orjson.
+
+    Args:
+        request: Incoming FastAPI request to read JSON from.
+
+    Returns:
+        Parsed JSON payload.
+
+    Raises:
+        HTTPException: 400 for invalid JSON bodies.
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON in request body")
+    try:
+        return orjson.loads(body)
+    except orjson.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON in request body") from exc
+
+
+def require_api_key(api_key: str) -> None:
+    """Validates the provided API key.
+
+    This function checks if the provided API key matches the expected one
+    based on the settings. If the validation fails, it raises an HTTPException
+    with a 401 Unauthorized status.
+
+    Args:
+        api_key (str): The API key provided by the user or client.
+
+    Raises:
+        HTTPException: If the API key is invalid, a 401 Unauthorized error is raised.
+
+    Examples:
+        >>> from mcpgateway.config import settings
+        >>> from pydantic import SecretStr
+        >>> settings.auth_required = True
+        >>> settings.basic_auth_user = "admin"
+        >>> settings.basic_auth_password = SecretStr("secret")
+        >>>
+        >>> # Valid API key
+        >>> require_api_key("admin:secret")  # Should not raise
+        >>>
+        >>> # Invalid API key
+        >>> try:
+        ...     require_api_key("wrong:key")
+        ... except HTTPException as e:
+        ...     e.status_code
+        401
+    """
+    if settings.auth_required:
+        expected = f"{settings.basic_auth_user}:{settings.basic_auth_password.get_secret_value()}"
+        if api_key != expected:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+
+async def invalidate_resource_cache(uri: Optional[str] = None) -> None:
+    """
+    Invalidates the resource cache.
+
+    If a specific URI is provided, only that resource will be removed from the cache.
+    If no URI is provided, the entire resource cache will be cleared.
+
+    Args:
+        uri (Optional[str]): The URI of the resource to invalidate from the cache. If None, the entire cache is cleared.
+
+    Examples:
+        >>> import asyncio
+        >>> # Test clearing specific URI from cache
+        >>> resource_cache.set("/test/resource", {"content": "test data"})
+        >>> resource_cache.get("/test/resource") is not None
+        True
+        >>> asyncio.run(invalidate_resource_cache("/test/resource"))
+        >>> resource_cache.get("/test/resource") is None
+        True
+        >>>
+        >>> # Test clearing entire cache
+        >>> resource_cache.set("/resource1", {"content": "data1"})
+        >>> resource_cache.set("/resource2", {"content": "data2"})
+        >>> asyncio.run(invalidate_resource_cache())
+        >>> resource_cache.get("/resource1") is None and resource_cache.get("/resource2") is None
+        True
+    """
+    if uri:
+        resource_cache.delete(uri)
+    else:
+        resource_cache.clear()
+
+
+def get_protocol_from_request(request: Request) -> str:
+    """
+    Return "https" or "http" based on:
+     1) X-Forwarded-Proto (if set by a proxy)
+     2) request.url.scheme  (e.g. when Gunicorn/Uvicorn is terminating TLS)
+
+    Args:
+        request (Request): The FastAPI request object.
+
+    Returns:
+        str: The protocol used for the request, either "http" or "https".
+
+    Examples:
+        Test with X-Forwarded-Proto header (proxy scenario):
+        >>> from mcpgateway import main
+        >>> from fastapi import Request
+        >>> from urllib.parse import urlparse
+        >>>
+        >>> # Mock request with X-Forwarded-Proto
+        >>> scope = {
+        ...     'type': 'http',
+        ...     'scheme': 'http',
+        ...     'headers': [(b'x-forwarded-proto', b'https')],
+        ...     'server': ('testserver', 80),
+        ...     'path': '/',
+        ... }
+        >>> req = Request(scope)
+        >>> main.get_protocol_from_request(req)
+        'https'
+
+        Test with comma-separated X-Forwarded-Proto:
+        >>> scope_multi = {
+        ...     'type': 'http',
+        ...     'scheme': 'http',
+        ...     'headers': [(b'x-forwarded-proto', b'https,http')],
+        ...     'server': ('testserver', 80),
+        ...     'path': '/',
+        ... }
+        >>> req_multi = Request(scope_multi)
+        >>> main.get_protocol_from_request(req_multi)
+        'https'
+
+        Test without X-Forwarded-Proto (direct connection):
+        >>> scope_direct = {
+        ...     'type': 'http',
+        ...     'scheme': 'https',
+        ...     'headers': [],
+        ...     'server': ('testserver', 443),
+        ...     'path': '/',
+        ... }
+        >>> req_direct = Request(scope_direct)
+        >>> main.get_protocol_from_request(req_direct)
+        'https'
+
+        Test with HTTP direct connection:
+        >>> scope_http = {
+        ...     'type': 'http',
+        ...     'scheme': 'http',
+        ...     'headers': [],
+        ...     'server': ('testserver', 80),
+        ...     'path': '/',
+        ... }
+        >>> req_http = Request(scope_http)
+        >>> main.get_protocol_from_request(req_http)
+        'http'
+    """
+    forwarded = request.headers.get("x-forwarded-proto")
+    if forwarded:
+        # may be a comma-separated list; take the first
+        return forwarded.split(",")[0].strip()
+    return request.url.scheme
+
+
+def update_url_protocol(request: Request) -> str:
+    """
+    Update the base URL protocol based on the request's scheme or forwarded headers.
+
+    Args:
+        request (Request): The FastAPI request object.
+
+    Returns:
+        str: The base URL with the correct protocol.
+
+    Examples:
+        Test URL protocol update with HTTPS proxy:
+        >>> from mcpgateway import main
+        >>> from fastapi import Request
+        >>>
+        >>> # Mock request with HTTPS forwarded proto
+        >>> scope_https = {
+        ...     'type': 'http',
+        ...     'scheme': 'http',
+        ...     'server': ('example.com', 80),
+        ...     'path': '/',
+        ...     'headers': [(b'x-forwarded-proto', b'https')],
+        ... }
+        >>> req_https = Request(scope_https)
+        >>> url = main.update_url_protocol(req_https)
+        >>> url.startswith('https://example.com')
+        True
+
+        Test URL protocol update with HTTP direct:
+        >>> scope_http = {
+        ...     'type': 'http',
+        ...     'scheme': 'http',
+        ...     'server': ('localhost', 8000),
+        ...     'path': '/',
+        ...     'headers': [],
+        ... }
+        >>> req_http = Request(scope_http)
+        >>> url = main.update_url_protocol(req_http)
+        >>> url.startswith('http://localhost:8000')
+        True
+
+        Test URL protocol update preserves host and port:
+        >>> scope_port = {
+        ...     'type': 'http',
+        ...     'scheme': 'https',
+        ...     'server': ('api.test.com', 443),
+        ...     'path': '/',
+        ...     'headers': [],
+        ... }
+        >>> req_port = Request(scope_port)
+        >>> url = main.update_url_protocol(req_port)
+        >>> 'api.test.com' in url and url.startswith('https://')
+        True
+
+        Test trailing slash removal:
+        >>> # URL should not end with trailing slash
+        >>> url = main.update_url_protocol(req_http)
+        >>> url.endswith('/')
+        False
+    """
+    parsed = urlparse(str(request.base_url))
+    proto = get_protocol_from_request(request)
+    new_parsed = parsed._replace(scheme=proto)
+    # urlunparse keeps netloc and path intact
+    return str(urlunparse(new_parsed)).rstrip("/")
+
+
+# Protocol APIs #
+@protocol_router.post("/initialize")
+async def initialize(request: Request, user=Depends(get_current_user)) -> InitializeResult:
+    """
+    Initialize a protocol.
+
+    This endpoint handles the initialization process of a protocol by accepting
+    a JSON request body and processing it. The `require_auth` dependency ensures that
+    the user is authenticated before proceeding.
+
+    Args:
+        request (Request): The incoming request object containing the JSON body.
+        user (str): The authenticated user (from `require_auth` dependency).
+
+    Returns:
+        InitializeResult: The result of the initialization process.
+
+    Raises:
+        HTTPException: If the request body contains invalid JSON, a 400 Bad Request error is raised.
+    """
+    try:
+        body = await _read_request_json(request)
+
+        logger.debug(f"Authenticated user {SecurityValidator.sanitize_log_message(str(user))} is initializing the protocol.")
+        return await session_registry.handle_initialize_logic(body)
+
+    except orjson.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON in request body",
+        )
+
+
+@protocol_router.post("/ping")
+async def ping(request: Request, user=Depends(get_current_user)) -> JSONResponse:
+    """
+    Handle a ping request according to the MCP specification.
+
+    This endpoint expects a JSON-RPC request with the method "ping" and responds
+    with a JSON-RPC response containing an empty result, as required by the protocol.
+
+    Args:
+        request (Request): The incoming FastAPI request.
+        user (str): The authenticated user (dependency injection).
+
+    Returns:
+        JSONResponse: A JSON-RPC response with an empty result or an error response.
+
+    Raises:
+        HTTPException: If the request method is not "ping".
+    """
+    req_id: Optional[str] = None
+    try:
+        body: dict = await _read_request_json(request)
+        if body.get("method") != "ping":
+            raise HTTPException(status_code=400, detail="Invalid method")
+        req_id = body.get("id")
+        logger.debug(f"Authenticated user {SecurityValidator.sanitize_log_message(str(user))} sent ping request.")
+        # Return an empty result per the MCP ping specification.
+        response: dict = {"jsonrpc": "2.0", "id": req_id, "result": {}}
+        return ORJSONResponse(content=response)
+    except Exception as e:
+        error_response: dict = {
+            "jsonrpc": "2.0",
+            "id": req_id,  # Now req_id is always defined
+            "error": {"code": -32603, "message": "Internal error", "data": str(e)},
+        }
+        return ORJSONResponse(status_code=500, content=error_response)
+
+
+@protocol_router.post("/notifications")
+async def handle_notification(request: Request, user=Depends(get_current_user)) -> None:
+    """
+    Handles incoming notifications from clients. Depending on the notification method,
+    different actions are taken (e.g., logging initialization, cancellation, or messages).
+
+    Args:
+        request (Request): The incoming request containing the notification data.
+        user (str): The authenticated user making the request.
+    """
+    body = await _read_request_json(request)
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} sent a notification")
+    if body.get("method") == "notifications/initialized":
+        logger.info("Client initialized")
+        await logging_service.notify("Client initialized", LogLevel.INFO)
+    elif body.get("method") == "notifications/cancelled":
+        # Note: requestId can be 0 (valid per JSON-RPC), so use 'is not None' and normalize to string
+        raw_request_id = body.get("params", {}).get("requestId")
+        request_id = str(raw_request_id) if raw_request_id is not None else None
+        reason = body.get("params", {}).get("reason")
+        logger.info(f"Request cancelled: {request_id}, reason: {reason}")
+        # Attempt local cancellation per MCP spec
+        if request_id is not None:
+            await _authorize_run_cancellation(request, user, request_id, as_jsonrpc_error=False)
+            await cancellation_service.cancel_run(request_id, reason=reason)
+        await logging_service.notify(f"Request cancelled: {request_id}", LogLevel.INFO)
+    elif body.get("method") == "notifications/message":
+        params = body.get("params", {})
+        await logging_service.notify(
+            params.get("data"),
+            LogLevel(params.get("level", "info")),
+            params.get("logger"),
+        )
+
+
+@protocol_router.post("/completion/complete")
+async def handle_completion(request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)):
+    """
+    Handles the completion of tasks by processing a completion request.
+
+    Args:
+        request (Request): The incoming request with completion data.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        The result of the completion process.
+    """
+    body = await _read_request_json(request)
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(user['email'])} sent a completion request")
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+    if is_admin and token_teams is None:
+        user_email = None
+    elif token_teams is None:
+        token_teams = []
+    return await completion_service.handle_completion(db, body, user_email=user_email, token_teams=token_teams)
+
+
+@protocol_router.post("/sampling/createMessage")
+async def handle_sampling(request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)):
+    """
+    Handles the creation of a new message for sampling.
+
+    Args:
+        request (Request): The incoming request with sampling data.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        The result of the message creation process.
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(user['email'])} sent a sampling request")
+    body = await _read_request_json(request)
+    return await sampling_handler.create_message(db, body)
+
+
+###############
+# Server APIs #
+###############
+@server_router.get("", response_model=Union[List[ServerRead], CursorPaginatedServersResponse])
+@server_router.get("/", response_model=Union[List[ServerRead], CursorPaginatedServersResponse])
+@require_permission("servers.read")
+async def list_servers(
+    request: Request,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of servers to return"),
+    include_inactive: bool = False,
+    include_metrics: bool = False,
+    tags: Optional[str] = None,
+    team_id: Optional[str] = None,
+    visibility: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Union[List[ServerRead], Dict[str, Any]]:
+    """
+    Lists servers accessible to the user, with team filtering and cursor pagination support.
+
+    Args:
+        request (Request): The incoming request object for team_id retrieval.
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of servers to return.
+        include_inactive (bool): Whether to include inactive servers in the response.
+        include_metrics (bool): Whether to include aggregated metrics in the response.
+        tags (Optional[str]): Comma-separated list of tags to filter by.
+        team_id (Optional[str]): Filter by specific team ID.
+        visibility (Optional[str]): Filter by visibility (private, team, public).
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Union[List[ServerRead], Dict[str, Any]]: A list of server objects or paginated response with nextCursor.
+    """
+    # Parse tags parameter if provided
+    tags_list = None
+    if tags:
+        tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    # Get user email for team filtering
+    user_email = get_user_email(user)
+
+    # Check team ID from token
+    token_team_id = getattr(request.state, "team_id", None)
+    token_teams = getattr(request.state, "token_teams", None)
+
+    # Check for team ID mismatch
+    if team_id is not None and token_team_id is not None and team_id != token_team_id:
+        return ORJSONResponse(
+            content={"message": "Access issue: This API token does not have the required permissions for this team."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # For listing, only narrow by team_id when explicitly requested via query param.
+    # Do NOT auto-narrow to token's single team; token_teams handles visibility scoping
+    # (public + team resources). Auto-narrowing would exclude public servers.
+
+    # SECURITY: token_teams is normalized in auth.py:
+    # - None: admin bypass (is_admin=true with explicit null teams) - sees ALL resources
+    # - []: public-only (missing teams or explicit empty) - sees only public
+    # - [...]: team-scoped - sees public + teams + user's private
+    is_admin_bypass = token_teams is None
+    is_public_only_token = token_teams is not None and len(token_teams) == 0
+
+    # Use consolidated server listing with optional team filtering
+    # For admin bypass: pass user_email=None and token_teams=None to skip all filtering
+    logger.debug(
+        f"User: {SecurityValidator.sanitize_log_message(user_email)} requested server list with include_inactive={include_inactive}, tags={tags_list}, team_id={team_id}, visibility={visibility}"
+    )
+    data, next_cursor = await server_service.list_servers(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        include_metrics=include_metrics,
+        tags=tags_list,
+        user_email=None if is_admin_bypass else user_email,  # Admin bypass: no user filtering
+        team_id=team_id,
+        visibility="public" if is_public_only_token and not visibility else visibility,
+        token_teams=token_teams,  # None = admin bypass, [] = public-only, [...] = team-scoped
+    )
+
+    if include_pagination:
+        return CursorPaginatedServersResponse.model_construct(servers=data, next_cursor=next_cursor)
+    return data
+
+
+@server_router.get("/{server_id}", response_model=ServerRead)
+@require_permission("servers.read")
+async def get_server(server_id: str, request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> ServerRead:
+    """
+    Retrieves a server by its ID.
+
+    Args:
+        server_id (str): The ID of the server to retrieve.
+        request (Request): The incoming request used for scoped access validation.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        ServerRead: The server object with the specified ID.
+
+    Raises:
+        HTTPException: If the server is not found.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested server with ID {server_id}")
+        server = await server_service.get_server(db, server_id)
+        _enforce_scoped_resource_access(request, db, user, f"/servers/{server_id}")
+        return server
+    except ServerNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@server_router.post("", response_model=ServerRead, status_code=201)
+@server_router.post("/", response_model=ServerRead, status_code=201)
+@require_permission("servers.create")
+async def create_server(
+    server: ServerCreate,
+    request: Request,
+    team_id: Optional[str] = Body(None, description="Team ID to assign server to"),
+    visibility: Optional[str] = Body(None, description="Server visibility: private, team, public"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ServerRead:
+    """
+    Creates a new server.
+
+    Args:
+        server (ServerCreate): The data for the new server.
+        request (Request): The incoming request object for extracting metadata.
+        team_id (Optional[str]): Team ID to assign the server to.
+        visibility (str): Server visibility level (private, team, public).
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        ServerRead: The created server object.
+
+    Raises:
+        HTTPException: If there is a conflict with the server name or other errors.
+    """
+    try:
+        # Extract metadata from request
+        metadata = MetadataCapture.extract_creation_metadata(request, user)
+
+        # Get user email and handle team assignment
+        user_email = get_user_email(user)
+
+        token_team_id = getattr(request.state, "team_id", None)
+        token_teams = getattr(request.state, "token_teams", None)
+
+        # SECURITY: Public-only tokens (teams == []) cannot create team/private resources
+        is_public_only_token = token_teams is not None and len(token_teams) == 0
+        if is_public_only_token and visibility in ("team", "private"):
+            return ORJSONResponse(
+                content={"message": "Public-only tokens cannot create team or private resources. Use visibility='public' or obtain a team-scoped token."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check for team ID mismatch (only for non-public-only tokens)
+        if not is_public_only_token and team_id is not None and token_team_id is not None and team_id != token_team_id:
+            return ORJSONResponse(
+                content={"message": "Access issue: This API token does not have the required permissions for this team."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Determine final team ID (public-only tokens get no team)
+        if is_public_only_token:
+            team_id = None
+        else:
+            team_id = team_id or token_team_id
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(user_email)} is creating a new server for team {team_id}")
+        result = await server_service.register_server(
+            db,
+            server,
+            created_by=metadata["created_by"],
+            created_from_ip=metadata["created_from_ip"],
+            created_via=metadata["created_via"],
+            created_user_agent=metadata["created_user_agent"],
+            team_id=team_id,
+            owner_email=user_email,
+            visibility=visibility,
+        )
+        db.commit()
+        db.close()
+        return result
+    except ServerNameConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ServerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValidationError as e:
+        logger.error(f"Validation error while creating server: {e}")
+        raise HTTPException(status_code=422, detail=ErrorFormatter.format_validation_error(e))
+    except IntegrityError as e:
+        logger.error(f"Integrity error while creating server: {e}")
+        raise HTTPException(status_code=409, detail=ErrorFormatter.format_database_error(e))
+
+
+@server_router.put("/{server_id}", response_model=ServerRead)
+@require_permission("servers.update")
+async def update_server(
+    server_id: str,
+    server: ServerUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ServerRead:
+    """
+    Updates the information of an existing server.
+
+    Args:
+        server_id (str): The ID of the server to update.
+        server (ServerUpdate): The updated server data.
+        request (Request): The incoming request object containing metadata.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        ServerRead: The updated server object.
+
+    Raises:
+        HTTPException: If the server is not found, there is a name conflict, or other errors.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is updating server with ID {server_id}")
+        # Extract modification metadata
+        mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)  # Version will be incremented in service
+
+        user_email: str = get_user_email(user)
+
+        result = await server_service.update_server(
+            db,
+            server_id,
+            server,
+            user_email,
+            modified_by=mod_metadata["modified_by"],
+            modified_from_ip=mod_metadata["modified_from_ip"],
+            modified_via=mod_metadata["modified_via"],
+            modified_user_agent=mod_metadata["modified_user_agent"],
+        )
+        db.commit()
+        db.close()
+        return result
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ServerNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ServerNameConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ServerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValidationError as e:
+        logger.error(f"Validation error while updating server {server_id}: {e}")
+        raise HTTPException(status_code=422, detail=ErrorFormatter.format_validation_error(e))
+    except IntegrityError as e:
+        logger.error(f"Integrity error while updating server {server_id}: {e}")
+        raise HTTPException(status_code=409, detail=ErrorFormatter.format_database_error(e))
+
+
+@server_router.post("/{server_id}/state", response_model=ServerRead)
+@require_permission("servers.update")
+async def set_server_state(
+    server_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ServerRead:
+    """
+    Sets the status of a server (activate or deactivate).
+
+    Args:
+        server_id (str): The ID of the server to set state for.
+        activate (bool): Whether to activate or deactivate the server.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        ServerRead: The server object after the status change.
+
+    Raises:
+        HTTPException: If the server is not found or there is an error.
+    """
+    try:
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is setting server with ID {server_id} to {'active' if activate else 'inactive'}")
+        return await server_service.set_server_state(db, server_id, activate, user_email=user_email)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ServerNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ServerLockConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ServerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@server_router.post("/{server_id}/toggle", response_model=ServerRead, deprecated=True)
+@require_permission("servers.update")
+async def toggle_server_status(
+    server_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ServerRead:
+    """DEPRECATED: Use /state endpoint instead. This endpoint will be removed in a future release.
+
+    Sets the status of a server (activate or deactivate).
+
+    Args:
+        server_id: The server ID.
+        activate: Whether to activate (True) or deactivate (False) the server.
+        db: Database session.
+        user: Authenticated user context.
+
+    Returns:
+        The updated server.
+    """
+
+    warnings.warn("The /toggle endpoint is deprecated. Use /state instead.", DeprecationWarning, stacklevel=2)
+    return await set_server_state(server_id, activate, db, user)
+
+
+@server_router.delete("/{server_id}", response_model=Dict[str, str])
+@require_permission("servers.delete")
+async def delete_server(
+    server_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this server"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
+    """
+    Deletes a server by its ID.
+
+    Args:
+        server_id (str): The ID of the server to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this server.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Dict[str, str]: A success message indicating the server was deleted.
+
+    Raises:
+        HTTPException: If the server is not found or there is an error.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is deleting server with ID {server_id}")
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        await server_service.get_server(db, server_id)
+        await server_service.delete_server(db, server_id, user_email=user_email, purge_metrics=purge_metrics)
+        db.commit()
+        db.close()
+        return {
+            "status": "success",
+            "message": f"Server {server_id} deleted successfully",
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ServerNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ServerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@server_router.get("/{server_id}/sse")
+@require_permission("servers.use")
+async def sse_endpoint(request: Request, server_id: str, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)):
+    """
+    Establishes a Server-Sent Events (SSE) connection for real-time updates about a server.
+
+    Args:
+        request (Request): The incoming request.
+        server_id (str): The ID of the server for which updates are received.
+        db (Session): The database session used for server existence and scope checks.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        The SSE response object for the established connection.
+
+    Raises:
+        HTTPException: If there is an error in establishing the SSE connection.
+        asyncio.CancelledError: If the request is cancelled during SSE setup.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is establishing SSE connection for server {server_id}")
+        await server_service.get_server(db, server_id)
+        _enforce_scoped_resource_access(request, db, user, f"/servers/{server_id}/sse")
+
+        base_url = update_url_protocol(request)
+        server_sse_url = f"{base_url}/servers/{server_id}"
+
+        # SSE transport generates its own session_id - server-initiated, not client-provided
+        transport = SSETransport(base_url=server_sse_url)
+        await transport.connect()
+        await session_registry.add_session(transport.session_id, transport)
+        await session_registry.set_session_owner(transport.session_id, get_user_email(user))
+
+        # Extract auth token from request (header OR cookie, like get_current_user_with_permissions)
+        # MUST be computed BEFORE create_sse_response to avoid race condition (Finding 1)
+        auth_token = None
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            auth_token = auth_header[7:]
+        elif hasattr(request, "cookies") and request.cookies:
+            # Cookie auth (admin UI sessions)
+            auth_token = request.cookies.get("jwt_token") or request.cookies.get("access_token")
+
+        # Extract and normalize token teams
+        # Returns None if no JWT payload (non-JWT auth), or list if JWT exists
+        # SECURITY: Preserve None vs [] distinction for admin bypass:
+        # - None: unrestricted (admin keeps bypass, non-admin gets their accessible resources)
+        # - []: public-only (admin bypass disabled)
+        # - [...]: team-scoped access
+        token_teams = _get_token_teams_from_request(request)
+
+        # Preserve is_admin from user object (for cookie-authenticated admins)
+        is_admin = False
+        if hasattr(user, "is_admin"):
+            is_admin = getattr(user, "is_admin", False)
+        elif isinstance(user, dict):
+            is_admin = user.get("is_admin", False) or user.get("user", {}).get("is_admin", False)
+
+        # Create enriched user dict
+        user_with_token = dict(user) if isinstance(user, dict) else {"email": getattr(user, "email", str(user))}
+        user_with_token["auth_token"] = auth_token
+        user_with_token["token_teams"] = token_teams  # None for unrestricted, [] for public-only, [...] for team-scoped
+        user_with_token["is_admin"] = is_admin  # Preserve admin status for fallback token
+
+        # Capture passthrough headers from the original SSE request for loopback /rpc calls.
+        # Without this, headers like X-Upstream-Authorization are silently dropped. See #3640.
+        # First-Party
+        from mcpgateway.utils.passthrough_headers import safe_extract_headers_for_loopback  # pylint: disable=import-outside-toplevel
+
+        user_with_token["_passthrough_headers"] = safe_extract_headers_for_loopback(dict(request.headers), "SSE")
+
+        # Defensive cleanup callback - runs immediately on client disconnect
+        async def on_disconnect_cleanup() -> None:
+            """Clean up session when SSE client disconnects."""
+            try:
+                await session_registry.remove_session(transport.session_id)
+                logger.debug("Defensive session cleanup completed: %s", transport.session_id)
+            except Exception as e:
+                logger.warning("Defensive session cleanup failed for %s: %s", transport.session_id, e)
+
+        # CRITICAL: Create and register respond task BEFORE create_sse_response (Finding 1 fix)
+        # This ensures the task exists when disconnect callback runs, preventing orphaned tasks
+        respond_task = asyncio.create_task(session_registry.respond(server_id, user_with_token, session_id=transport.session_id))
+        session_registry.register_respond_task(transport.session_id, respond_task)
+
+        try:
+            response = await transport.create_sse_response(request, on_disconnect_callback=on_disconnect_cleanup)
+        except asyncio.CancelledError:
+            # Request cancelled - still need to clean up to prevent orphaned tasks
+            logger.debug(f"SSE request cancelled for {transport.session_id}, cleaning up")
+            try:
+                await session_registry.remove_session(transport.session_id)
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup after SSE cancellation failed: {cleanup_error}")
+            raise  # Re-raise CancelledError
+        except Exception as sse_error:
+            # CRITICAL: Cleanup on failure - respond task and session would be orphaned otherwise
+            logger.error(f"create_sse_response failed for {transport.session_id}: {sse_error}")
+            try:
+                await session_registry.remove_session(transport.session_id)
+            except Exception as cleanup_error:
+                logger.warning(f"Cleanup after SSE failure also failed: {cleanup_error}")
+            raise
+
+        tasks = BackgroundTasks()
+        tasks.add_task(session_registry.remove_session, transport.session_id)
+        response.background = tasks
+        logger.info(f"SSE connection established: {transport.session_id}")
+        return response
+    except ServerNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"SSE connection error: {e}")
+        raise HTTPException(status_code=500, detail="SSE connection failed")
+
+
+@server_router.post("/{server_id}/message")
+@require_permission("servers.use")
+async def message_endpoint(request: Request, server_id: str = Depends(require_valid_server), user=Depends(get_current_user_with_permissions)):
+    """
+    Handles incoming messages for a specific server.
+
+    Args:
+        request (Request): The incoming message request.
+        server_id (str): The ID of the server receiving the message.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        JSONResponse: A success status after processing the message.
+
+    Raises:
+        HTTPException: If there are errors processing the message.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} sent a message to server {server_id}")
+        session_id = request.query_params.get("session_id")
+        if not session_id:
+            logger.error("Missing session_id in message request")
+            raise HTTPException(status_code=400, detail="Missing session_id")
+        set_trace_session_id(session_id)
+
+        await _assert_session_owner_or_admin(request, user, session_id)
+
+        message = await _read_request_json(request)
+
+        # Check if this is an elicitation response (JSON-RPC response with result containing action)
+        is_elicitation_response = False
+        if "result" in message and isinstance(message.get("result"), dict):
+            result_data = message["result"]
+            if "action" in result_data and result_data.get("action") in ["accept", "decline", "cancel"]:
+                # This looks like an elicitation response
+                request_id = message.get("id")
+                if request_id:
+                    # Try to complete the elicitation
+                    # First-Party
+                    from mcpgateway.common.models import ElicitResult  # pylint: disable=import-outside-toplevel
+                    from mcpgateway.services.elicitation_service import get_elicitation_service  # pylint: disable=import-outside-toplevel
+
+                    elicitation_service = get_elicitation_service()
+                    try:
+                        elicit_result = ElicitResult(**result_data)
+                        if elicitation_service.complete_elicitation(request_id, elicit_result):
+                            logger.info(f"Completed elicitation {request_id} from session {session_id}")
+                            is_elicitation_response = True
+                    except Exception as e:
+                        logger.warning(f"Failed to process elicitation response: {e}")
+
+        # If not an elicitation response, broadcast normally
+        if not is_elicitation_response:
+            await session_registry.broadcast(
+                session_id=session_id,
+                message=message,
+            )
+
+        return ORJSONResponse(content={"status": "success"}, status_code=202)
+    except ValueError as e:
+        logger.error(f"Invalid message format: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Message handling error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process message")
+
+
+@server_router.get("/{server_id}/tools", response_model=List[ToolRead])
+@require_permission("servers.read")
+async def server_get_tools(
+    request: Request,
+    server_id: str,
+    include_inactive: bool = False,
+    include_metrics: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> List[Dict[str, Any]]:
+    """
+    List tools for the server  with an option to include inactive tools.
+
+    This endpoint retrieves a list of tools from the database, optionally including
+    those that are inactive. The inactive filter helps administrators manage tools
+    that have been deactivated but not deleted from the system.
+
+    Args:
+        request (Request): FastAPI request object.
+        server_id (str): ID of the server
+        include_inactive (bool): Whether to include inactive tools in the results.
+        include_metrics (bool): Whether to include metrics in the tools results.
+        db (Session): Database session dependency.
+        user (str): Authenticated user dependency.
+
+    Returns:
+        List[ToolRead]: A list of tool records formatted with by_alias=True.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} has listed tools for the server_id: {server_id}")
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+    _req_email, _req_is_admin = user_email, is_admin
+    _req_team_roles = get_user_team_roles(db, _req_email) if _req_email and not _req_is_admin else None
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+    tools = await tool_service.list_server_tools(
+        db,
+        server_id=server_id,
+        include_inactive=include_inactive,
+        include_metrics=include_metrics,
+        user_email=user_email,
+        token_teams=token_teams,
+        requesting_user_email=_req_email,
+        requesting_user_is_admin=_req_is_admin,
+        requesting_user_team_roles=_req_team_roles,
+    )
+    return [tool.model_dump(by_alias=True) for tool in tools]
+
+
+@server_router.get("/{server_id}/resources", response_model=List[ResourceRead])
+@require_permission("servers.read")
+async def server_get_resources(
+    request: Request,
+    server_id: str,
+    include_inactive: bool = False,
+    include_metrics: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> List[Dict[str, Any]]:
+    """
+    List resources for the server with an option to include inactive resources.
+
+    This endpoint retrieves a list of resources from the database, optionally including
+    those that are inactive. The inactive filter is useful for administrators who need
+    to view or manage resources that have been deactivated but not deleted.
+
+    Args:
+        request (Request): FastAPI request object.
+        server_id (str): ID of the server
+        include_inactive (bool): Whether to include inactive resources in the results.
+        include_metrics (bool): Whether to include aggregated metrics in the results.
+        db (Session): Database session dependency.
+        user (str): Authenticated user dependency.
+
+    Returns:
+        List[ResourceRead]: A list of resource records formatted with by_alias=True.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} has listed resources for the server_id: {server_id}")
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+    resources = await resource_service.list_server_resources(
+        db, server_id=server_id, include_inactive=include_inactive, include_metrics=include_metrics, user_email=user_email, token_teams=token_teams
+    )
+    return [resource.model_dump(by_alias=True) for resource in resources]
+
+
+@server_router.get("/{server_id}/prompts", response_model=List[PromptRead])
+@require_permission("servers.read")
+async def server_get_prompts(
+    request: Request,
+    server_id: str,
+    include_inactive: bool = False,
+    include_metrics: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> List[Dict[str, Any]]:
+    """
+    List prompts for the server with an option to include inactive prompts.
+
+    This endpoint retrieves a list of prompts from the database, optionally including
+    those that are inactive. The inactive filter helps administrators see and manage
+    prompts that have been deactivated but not deleted from the system.
+
+    Args:
+        request (Request): FastAPI request object.
+        server_id (str): ID of the server
+        include_inactive (bool): Whether to include inactive prompts in the results.
+        include_metrics (bool): Whether to include aggregated metrics in the results.
+        db (Session): Database session dependency.
+        user (str): Authenticated user dependency.
+
+    Returns:
+        List[PromptRead]: A list of prompt records formatted with by_alias=True.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} has listed prompts for the server_id: {server_id}")
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even empty [] for public-only), respect it
+    if is_admin and token_teams is None:
+        user_email = None
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+    prompts = await prompt_service.list_server_prompts(db, server_id=server_id, include_inactive=include_inactive, include_metrics=include_metrics, user_email=user_email, token_teams=token_teams)
+    return [prompt.model_dump(by_alias=True) for prompt in prompts]
+
+
+##################
+# A2A Agent APIs #
+##################
+@a2a_router.get("", response_model=Union[List[A2AAgentRead], CursorPaginatedA2AAgentsResponse])
+@a2a_router.get("/", response_model=Union[List[A2AAgentRead], CursorPaginatedA2AAgentsResponse])
+@require_permission("a2a.read")
+async def list_a2a_agents(
+    request: Request,
+    include_inactive: bool = False,
+    tags: Optional[str] = None,
+    team_id: Optional[str] = Query(None, description="Filter by team ID"),
+    visibility: Optional[str] = Query(None, description="Filter by visibility (private, team, public)"),
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, description="Maximum number of agents to return"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Union[List[A2AAgentRead], Dict[str, Any]]:
+    """
+    Lists A2A agents user has access to with cursor pagination and team filtering.
+
+    Args:
+        request (Request): The FastAPI request object for team_id retrieval.
+        include_inactive (bool): Whether to include inactive agents in the response.
+        tags (Optional[str]): Comma-separated list of tags to filter by.
+        team_id (Optional[str]): Team ID to filter by.
+        visibility (Optional[str]): Visibility level to filter by.
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of agents to return.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Union[List[A2AAgentRead], Dict[str, Any]]: A list of A2A agent objects or paginated response with nextCursor.
+
+    Raises:
+        HTTPException: If A2A service is not available.
+    """
+    # Parse tags parameter if provided
+    tags_list = None
+    if tags:
+        tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+    if a2a_service is None:
+        raise HTTPException(status_code=503, detail="A2A service not available")
+
+    # Get filtering context from token (respects token scope)
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even for admins), respect it for least-privilege
+    if is_admin and token_teams is None:
+        user_email = None
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
+    # Check team_id from request.state (set during auth)
+    token_team_id = getattr(request.state, "team_id", None)
+
+    # Check for team ID mismatch (only applies when both are specified and token has teams)
+    if team_id is not None and token_team_id is not None and team_id != token_team_id:
+        return ORJSONResponse(
+            content={"message": "Access issue: This API token does not have the required permissions for this team."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # For listing, only narrow by team_id when explicitly requested via query param.
+    # Do NOT auto-narrow to token's single team; token_teams handles visibility scoping.
+
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(user_email)} requested A2A agent list with team_id={team_id}, visibility={visibility}, tags={tags_list}, cursor={cursor}")
+
+    # Use consolidated agent listing with token-based team filtering
+    data, next_cursor = await a2a_service.list_agents(
+        db=db,
+        cursor=cursor,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        limit=limit,
+        user_email=user_email,
+        token_teams=token_teams,
+        team_id=team_id,
+        visibility=visibility,
+    )
+
+    if include_pagination:
+        return CursorPaginatedA2AAgentsResponse.model_construct(agents=data, next_cursor=next_cursor)
+    return data
+
+
+@a2a_router.get("/{agent_id}", response_model=A2AAgentRead)
+@require_permission("a2a.read")
+async def get_a2a_agent(
+    agent_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> A2AAgentRead:
+    """
+    Retrieves an A2A agent by its ID.
+
+    Args:
+        agent_id (str): The ID of the agent to retrieve.
+        request (Request): The FastAPI request object for team_id retrieval.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        A2AAgentRead: The agent object with the specified ID.
+
+    Raises:
+        HTTPException: If the agent is not found or user lacks access.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested A2A agent with ID {agent_id}")
+        if a2a_service is None:
+            raise HTTPException(status_code=503, detail="A2A service not available")
+
+        # Get filtering context from token (respects token scope)
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+        # Admin bypass - only when token has NO team restrictions
+        if is_admin and token_teams is None:
+            token_teams = None  # Admin unrestricted
+        elif token_teams is None:
+            token_teams = []  # Non-admin without teams = public-only
+
+        return await a2a_service.get_agent(
+            db,
+            agent_id,
+            user_email=user_email,
+            token_teams=token_teams,
+        )
+    except A2AAgentNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@a2a_router.post("", response_model=A2AAgentRead, status_code=201)
+@a2a_router.post("/", response_model=A2AAgentRead, status_code=201)
+@require_permission("a2a.create")
+async def create_a2a_agent(
+    agent: A2AAgentCreate,
+    request: Request,
+    team_id: Optional[str] = Body(None, description="Team ID to assign agent to"),
+    visibility: Optional[str] = Body("public", description="Agent visibility: private, team, public"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> A2AAgentRead:
+    """
+    Creates a new A2A agent.
+
+    Args:
+        agent (A2AAgentCreate): The data for the new agent.
+        request (Request): The FastAPI request object for metadata extraction.
+        team_id (Optional[str]): Team ID to assign the agent to.
+        visibility (str): Agent visibility level (private, team, public).
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        A2AAgentRead: The created agent object.
+
+    Raises:
+        HTTPException: If there is a conflict with the agent name or other errors.
+    """
+    try:
+        # Extract metadata from request
+        metadata = MetadataCapture.extract_creation_metadata(request, user)
+
+        # Get user email and handle team assignment
+        user_email = get_user_email(user)
+
+        token_team_id = getattr(request.state, "team_id", None)
+        token_teams = getattr(request.state, "token_teams", None)
+
+        # SECURITY: Public-only tokens (teams == []) cannot create team/private resources
+        is_public_only_token = token_teams is not None and len(token_teams) == 0
+        if is_public_only_token and visibility in ("team", "private"):
+            return ORJSONResponse(
+                content={"message": "Public-only tokens cannot create team or private resources. Use visibility='public' or obtain a team-scoped token."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check for team ID mismatch (only for non-public-only tokens)
+        if not is_public_only_token and team_id is not None and token_team_id is not None and team_id != token_team_id:
+            return ORJSONResponse(
+                content={"message": "Access issue: This API token does not have the required permissions for this team."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Determine final team ID (public-only tokens get no team)
+        if is_public_only_token:
+            team_id = None
+        else:
+            team_id = team_id or token_team_id
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(user_email)} is creating a new A2A agent for team {team_id}")
+        if a2a_service is None:
+            raise HTTPException(status_code=503, detail="A2A service not available")
+        return await a2a_service.register_agent(
+            db,
+            agent,
+            created_by=metadata["created_by"],
+            created_from_ip=metadata["created_from_ip"],
+            created_via=metadata["created_via"],
+            created_user_agent=metadata["created_user_agent"],
+            import_batch_id=metadata["import_batch_id"],
+            federation_source=metadata["federation_source"],
+            team_id=team_id,
+            owner_email=user_email,
+            visibility=visibility,
+        )
+    except A2AAgentNameConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except A2AAgentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValidationError as e:
+        logger.error(f"Validation error while creating A2A agent: {e}")
+        raise HTTPException(status_code=422, detail=ErrorFormatter.format_validation_error(e))
+    except IntegrityError as e:
+        logger.error(f"Integrity error while creating A2A agent: {e}")
+        raise HTTPException(status_code=409, detail=ErrorFormatter.format_database_error(e))
+
+
+@a2a_router.put("/{agent_id}", response_model=A2AAgentRead)
+@require_permission("a2a.update")
+async def update_a2a_agent(
+    agent_id: str,
+    agent: A2AAgentUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> A2AAgentRead:
+    """
+    Updates the information of an existing A2A agent.
+
+    Args:
+        agent_id (str): The ID of the agent to update.
+        agent (A2AAgentUpdate): The updated agent data.
+        request (Request): The FastAPI request object for metadata extraction.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        A2AAgentRead: The updated agent object.
+
+    Raises:
+        HTTPException: If the agent is not found, there is a name conflict, or other errors.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is updating A2A agent with ID {agent_id}")
+        # Extract modification metadata
+        mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)  # Version will be incremented in service
+
+        if a2a_service is None:
+            raise HTTPException(status_code=503, detail="A2A service not available")
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        return await a2a_service.update_agent(
+            db,
+            agent_id,
+            agent,
+            modified_by=mod_metadata["modified_by"],
+            modified_from_ip=mod_metadata["modified_from_ip"],
+            modified_via=mod_metadata["modified_via"],
+            modified_user_agent=mod_metadata["modified_user_agent"],
+            user_email=user_email,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except A2AAgentNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except A2AAgentNameConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except A2AAgentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValidationError as e:
+        logger.error(f"Validation error while updating A2A agent {agent_id}: {e}")
+        raise HTTPException(status_code=422, detail=ErrorFormatter.format_validation_error(e))
+    except IntegrityError as e:
+        logger.error(f"Integrity error while updating A2A agent {agent_id}: {e}")
+        raise HTTPException(status_code=409, detail=ErrorFormatter.format_database_error(e))
+
+
+@a2a_router.post("/{agent_id}/state", response_model=A2AAgentRead)
+@require_permission("a2a.update")
+async def set_a2a_agent_state(
+    agent_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> A2AAgentRead:
+    """
+    Sets the status of an A2A agent (activate or deactivate).
+
+    Args:
+        agent_id (str): The ID of the agent to update.
+        activate (bool): Whether to activate or deactivate the agent.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        A2AAgentRead: The agent object after the status change.
+
+    Raises:
+        HTTPException: If the agent is not found or there is an error.
+    """
+    try:
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is toggling A2A agent with ID {agent_id} to {'active' if activate else 'inactive'}")
+        if a2a_service is None:
+            raise HTTPException(status_code=503, detail="A2A service not available")
+        return await a2a_service.set_agent_state(db, agent_id, activate, user_email=user_email)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except A2AAgentNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except A2AAgentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@a2a_router.post("/{agent_id}/toggle", response_model=A2AAgentRead, deprecated=True)
+@require_permission("a2a.update")
+async def toggle_a2a_agent_status(
+    agent_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> A2AAgentRead:
+    """DEPRECATED: Use /state endpoint instead. This endpoint will be removed in a future release.
+
+    Sets the status of an A2A agent (activate or deactivate).
+
+    Args:
+        agent_id: The A2A agent ID.
+        activate: Whether to activate (True) or deactivate (False) the agent.
+        db: Database session.
+        user: Authenticated user context.
+
+    Returns:
+        The updated A2A agent.
+    """
+
+    warnings.warn("The /toggle endpoint is deprecated. Use /state instead.", DeprecationWarning, stacklevel=2)
+    return await set_a2a_agent_state(agent_id, activate, db, user)
+
+
+@a2a_router.delete("/{agent_id}", response_model=Dict[str, str])
+@require_permission("a2a.delete")
+async def delete_a2a_agent(
+    agent_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this agent"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
+    """
+    Deletes an A2A agent by its ID.
+
+    Args:
+        agent_id (str): The ID of the agent to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this agent.
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Dict[str, str]: A success message indicating the agent was deleted.
+
+    Raises:
+        HTTPException: If the agent is not found or there is an error.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is deleting A2A agent with ID {agent_id}")
+        if a2a_service is None:
+            raise HTTPException(status_code=503, detail="A2A service not available")
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        await a2a_service.delete_agent(db, agent_id, user_email=user_email, purge_metrics=purge_metrics)
+        return {
+            "status": "success",
+            "message": f"A2A Agent {agent_id} deleted successfully",
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except A2AAgentNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except A2AAgentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@a2a_router.post("/{agent_name}/invoke", response_model=Dict[str, Any])
+@require_permission("a2a.invoke")
+async def invoke_a2a_agent(
+    agent_name: str,
+    request: Request,
+    parameters: Dict[str, Any] = Body(default_factory=dict),
+    interaction_type: str = Body(default="query"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Invokes an A2A agent with the specified parameters.
+
+    Args:
+        agent_name (str): The name of the agent to invoke.
+        request (Request): The FastAPI request object for team_id retrieval.
+        parameters (Dict[str, Any]): Parameters for the agent interaction.
+        interaction_type (str): Type of interaction (query, execute, etc.).
+        db (Session): The database session used to interact with the data store.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Dict[str, Any]: The response from the A2A agent.
+
+    Raises:
+        HTTPException: If the agent is not found, user lacks access, or there is an error during invocation.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is invoking A2A agent '{agent_name}' with type '{interaction_type}'")
+        if a2a_service is None:
+            raise HTTPException(status_code=503, detail="A2A service not available")
+
+        # Get filtering context from token (respects token scope)
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+        # Admin bypass - only when token has NO team restrictions
+        if is_admin and token_teams is None:
+            token_teams = None  # Admin unrestricted
+        elif token_teams is None:
+            token_teams = []  # Non-admin without teams = public-only
+
+        user_id = None
+        if isinstance(user, dict):
+            user_id = str(user.get("id") or user.get("sub") or user_email)
+        else:
+            user_id = str(user)
+
+        # Read the federation hop counter from the request header using
+        # the shared parser so Python and Rust behave identically: strict
+        # ASCII-digit decoding with saturation on overflow, warn on
+        # malformed input.  `invoke_agent` rejects at `uaid_max_federation_hops`
+        # before any UAID or agent dispatch, breaking both A→B→A loops
+        # and self-referential `endpoint_url` loops.
+        hop_count = uaid_utils.read_hop_count(request.headers)
+
+        return await a2a_service.invoke_agent(
+            db,
+            agent_name,
+            parameters,
+            interaction_type,
+            user_id=user_id,
+            user_email=user_email,
+            token_teams=token_teams,
+            hop_count=hop_count,
+        )
+    except A2AAgentNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except A2AAgentError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+#############
+# Tool APIs #
+#############
+@tool_router.get("", response_model=Union[List[ToolRead], CursorPaginatedToolsResponse])
+@tool_router.get("/", response_model=Union[List[ToolRead], CursorPaginatedToolsResponse])
+@require_permission("tools.read")
+async def list_tools(
+    request: Request,
+    cursor: Optional[str] = None,
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of tools to return. 0 means all (no limit). Default uses pagination_default_page_size."),
+    include_inactive: bool = False,
+    tags: Optional[str] = None,
+    team_id: Optional[str] = Query(None, description="Filter by team ID"),
+    visibility: Optional[str] = Query(None, description="Filter by visibility: private, team, public"),
+    gateway_id: Optional[str] = Query(None, description="Filter by gateway ID"),
+    db: Session = Depends(get_db),
+    apijsonpath: Optional[str] = Query(None, description="Optional JSONPath modifier as JSON string"),
+    user=Depends(get_current_user_with_permissions),
+) -> ToolsResponse:
+    """List all registered tools with team-based filtering and pagination support.
+
+    Args:
+        request (Request): The FastAPI request object for team_id retrieval
+        cursor: Pagination cursor for fetching the next set of results
+        include_pagination: Whether to include cursor pagination metadata in the response
+        limit: Maximum number of tools to return. Use 0 for all tools (no limit).
+            If not specified, uses pagination_default_page_size (default: 50).
+        include_inactive: Whether to include inactive tools in the results
+        tags: Comma-separated list of tags to filter by (e.g., "api,data")
+        team_id: Optional team ID to filter tools by specific team
+        visibility: Optional visibility filter (private, team, public)
+        gateway_id: Optional gateway ID to filter tools by specific gateway
+        db: Database session
+        apijsonpath: Optional JSON-Path modifier supplied as URL-encoded query parameter.
+                     Example: ?apijsonpath=%7B%22jsonpath%22%3A%22%24.name%22%7D
+                     (decoded: {"jsonpath":"$.name"})
+                     Use to filter or transform the response via JSONPath expressions.
+        user: Authenticated user with permissions
+
+    Returns:
+        List of tools or modified result based on jsonpath
+
+    Raises:
+        HTTPException: If JSONPath modifier fails to process the tools list
+    """
+
+    # Validate apijsonpath early — fail fast before the database query
+    parsed_apijsonpath = _parse_apijsonpath(apijsonpath)
+
+    # Parse tags parameter if provided
+    tags_list = None
+    if tags:
+        tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+    # Get filtering context from token (respects token scope)
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+    # Capture original identity for header masking (before admin bypass modifies user_email)
+    _req_email, _req_is_admin = user_email, is_admin
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even for admins), respect it for least-privilege
+    if is_admin and token_teams is None:
+        user_email = None
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
+    # Check team_id from request.state (set during auth)
+    token_team_id = getattr(request.state, "team_id", None)
+
+    # Check for team ID mismatch (only applies when both are specified and token has teams)
+    if team_id is not None and token_team_id is not None and team_id != token_team_id:
+        return ORJSONResponse(
+            content={"message": "Access issue: This API token does not have the required permissions for this team."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # For listing, only narrow by team_id when explicitly requested via query param.
+    # Do NOT auto-narrow to token's single team; token_teams handles visibility scoping.
+
+    # Use unified list_tools() with token-based team filtering
+    # Always apply visibility filtering based on token scope
+    _req_team_roles = get_user_team_roles(db, _req_email) if _req_email and not _req_is_admin else None
+    data, next_cursor = await tool_service.list_tools(
+        db=db,
+        cursor=cursor,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        gateway_id=gateway_id,
+        limit=limit,
+        user_email=user_email,
+        team_id=team_id,
+        visibility=visibility,
+        token_teams=token_teams,
+        requesting_user_email=_req_email,
+        requesting_user_is_admin=_req_is_admin,
+        requesting_user_team_roles=_req_team_roles,
+    )
+    # Release transaction before response serialization
+    db.commit()
+    db.close()
+
+    if parsed_apijsonpath is None:
+        if include_pagination:
+            return CursorPaginatedToolsResponse.model_construct(tools=data, next_cursor=next_cursor)
+        return data
+
+    tools_dict_list = [tool.to_dict(use_alias=True) for tool in data]
+    try:
+        result = jsonpath_modifier(tools_dict_list, parsed_apijsonpath.jsonpath, parsed_apijsonpath.mapping)
+
+        # If pagination is requested, wrap the result with cursor metadata.
+        # Use "nextCursor" to match the CursorPaginatedToolsResponse alias contract.
+        if include_pagination:
+            paginated_result = {"tools": result, "nextCursor": next_cursor}
+            return ORJSONResponse(content=paginated_result)
+
+        # Return ORJSONResponse to bypass FastAPI's response_model validation
+        return ORJSONResponse(content=result)
+    except HTTPException:
+        # Re-raise HTTPException as-is (preserves 400 from apijsonpath parsing)
+        raise
+    except Exception:
+        logger.exception("JSONPath modifier failed while processing tools list")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="JSONPath modifier error")
+
+
+@tool_router.post("", response_model=ToolRead)
+@tool_router.post("/", response_model=ToolRead)
+@require_permission("tools.create")
+async def create_tool(
+    tool: ToolCreate,
+    request: Request,
+    team_id: Optional[str] = Body(None, description="Team ID to assign tool to"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ToolRead:
+    """
+    Creates a new tool in the system with team assignment support.
+
+    Args:
+        tool (ToolCreate): The data needed to create the tool.
+        request (Request): The FastAPI request object for metadata extraction.
+        team_id (Optional[str]): Team ID to assign the tool to.
+        db (Session): The database session dependency.
+        user: The authenticated user making the request.
+
+    Returns:
+        ToolRead: The created tool data.
+
+    Raises:
+        HTTPException: If the tool name already exists or other validation errors occur.
+    """
+    try:
+        # Extract metadata from request
+        metadata = MetadataCapture.extract_creation_metadata(request, user)
+
+        # Get user email and handle team assignment
+        user_email = get_user_email(user)
+
+        token_team_id = getattr(request.state, "team_id", None)
+        token_teams = getattr(request.state, "token_teams", None)
+
+        # SECURITY: Public-only tokens (teams == []) cannot create team/private resources
+        is_public_only_token = token_teams is not None and len(token_teams) == 0
+        if is_public_only_token and tool.visibility in ("team", "private"):
+            return ORJSONResponse(
+                content={"message": "Public-only tokens cannot create team or private resources. Use visibility='public' or obtain a team-scoped token."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check for team ID mismatch (only for non-public-only tokens)
+        if not is_public_only_token and team_id is not None and token_team_id is not None and team_id != token_team_id:
+            return ORJSONResponse(
+                content={"message": "Access issue: This API token does not have the required permissions for this team."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Determine final team ID (public-only tokens get no team)
+        if is_public_only_token:
+            team_id = None
+        else:
+            team_id = team_id or token_team_id
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(user_email)} is creating a new tool for team {team_id}")
+        result = await tool_service.register_tool(
+            db,
+            tool,
+            created_by=metadata["created_by"],
+            created_from_ip=metadata["created_from_ip"],
+            created_via=metadata["created_via"],
+            created_user_agent=metadata["created_user_agent"],
+            import_batch_id=metadata["import_batch_id"],
+            federation_source=metadata["federation_source"],
+            team_id=team_id,
+            owner_email=user_email,
+            visibility=tool.visibility,
+        )
+        db.commit()
+        db.close()
+        return result
+    except Exception as ex:
+        logger.error(f"Error while creating tool: {ex}")
+        if isinstance(ex, ToolNameConflictError):
+            if not ex.enabled and ex.tool_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Tool name already exists but is inactive. Consider activating it with ID: {ex.tool_id}",
+                )
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(ex))
+        if isinstance(ex, (ValidationError, ValueError)):
+            logger.error(f"Validation error while creating tool: {ex}")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=ErrorFormatter.format_validation_error(ex))
+        if isinstance(ex, IntegrityError):
+            logger.error(f"Integrity error while creating tool: {ex}")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=ErrorFormatter.format_database_error(ex))
+        if isinstance(ex, ToolError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ex))
+        logger.error(f"Unexpected error while creating tool: {ex}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while creating the tool")
+
+
+@tool_router.get("/{tool_id}", response_model=Union[ToolRead, Dict])
+@require_permission("tools.read")
+async def get_tool(
+    tool_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+    apijsonpath: Optional[str] = Query(None, description="Optional JSONPath modifier as JSON string"),
+) -> ToolResponse:
+    """
+    Retrieve a tool by ID, optionally applying a JSONPath post-filter.
+
+    Args:
+        tool_id: The numeric ID of the tool.
+        request: The incoming HTTP request.
+        db:     Active SQLAlchemy session (dependency).
+        user:   Authenticated username (dependency).
+        apijsonpath: Optional JSON-Path modifier supplied as URL-encoded query parameter.
+                     Example: ?apijsonpath=%7B%22jsonpath%22%3A%22%24.name%22%7D
+                     (decoded: {"jsonpath":"$.name","mapping":null})
+                     Use to filter or transform the response via JSONPath expressions.
+
+    Returns:
+        The raw ``ToolRead`` model **or** a JSON-transformed ``dict`` if
+        a JSONPath filter/mapping was supplied, **or** an ``ORJSONResponse``
+        when JSONPath modifiers are applied.
+
+    Raises:
+        HTTPException: If the tool does not exist or the transformation fails.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is retrieving tool with ID {tool_id}")
+        _req_email, _, _req_is_admin = _get_rpc_filter_context(request, user)
+        _req_team_roles = get_user_team_roles(db, _req_email) if _req_email and not _req_is_admin else None
+        data = await tool_service.get_tool(db, tool_id, requesting_user_email=_req_email, requesting_user_is_admin=_req_is_admin, requesting_user_team_roles=_req_team_roles)
+        _enforce_scoped_resource_access(request, db, user, f"/tools/{tool_id}")
+
+        # Parse apijsonpath parameter (handles both string and JsonPathModifier inputs)
+        parsed_apijsonpath = _parse_apijsonpath(apijsonpath)
+        if parsed_apijsonpath is None:
+            return data
+
+        data_dict = data.to_dict(use_alias=True)
+        try:
+            result = jsonpath_modifier(data_dict, parsed_apijsonpath.jsonpath, parsed_apijsonpath.mapping)
+            # Return ORJSONResponse to bypass FastAPI's response_model validation
+            return ORJSONResponse(content=result)
+        except HTTPException:
+            # Re-raise HTTPException as-is (preserves 400 from apijsonpath parsing)
+            raise
+        except Exception:
+            logger.exception("JSONPath modifier failed while processing single tool")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="JSONPath modifier error")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@tool_router.put("/{tool_id}", response_model=ToolRead)
+@require_permission("tools.update")
+async def update_tool(
+    tool_id: str,
+    tool: ToolUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ToolRead:
+    """
+    Updates an existing tool with new data.
+
+    Args:
+        tool_id (str): The ID of the tool to update.
+        tool (ToolUpdate): The updated tool information.
+        request (Request): The FastAPI request object for metadata extraction.
+        db (Session): The database session dependency.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        ToolRead: The updated tool data.
+
+    Raises:
+        HTTPException: If an error occurs during the update.
+    """
+    try:
+        # Get current tool to extract current version
+        current_tool = db.get(DbTool, tool_id)
+        current_version = getattr(current_tool, "version", 0) if current_tool else 0
+
+        # Extract modification metadata
+        mod_metadata = MetadataCapture.extract_modification_metadata(request, user, current_version)
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is updating tool with ID {tool_id}")
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        result = await tool_service.update_tool(
+            db,
+            tool_id,
+            tool,
+            modified_by=mod_metadata["modified_by"],
+            modified_from_ip=mod_metadata["modified_from_ip"],
+            modified_via=mod_metadata["modified_via"],
+            modified_user_agent=mod_metadata["modified_user_agent"],
+            user_email=user_email,
+        )
+        db.commit()
+        db.close()
+        return result
+    except Exception as ex:
+        if isinstance(ex, PermissionError):
+            raise HTTPException(status_code=403, detail=str(ex))
+        if isinstance(ex, ToolNotFoundError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(ex))
+        if isinstance(ex, ValidationError):
+            logger.error(f"Validation error while updating tool: {ex}")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=ErrorFormatter.format_validation_error(ex))
+        if isinstance(ex, IntegrityError):
+            logger.error(f"Integrity error while updating tool: {ex}")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=ErrorFormatter.format_database_error(ex))
+        if isinstance(ex, ToolError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ex))
+        logger.error(f"Unexpected error while updating tool: {ex}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while updating the tool")
+
+
+@tool_router.delete("/{tool_id}")
+@require_permission("tools.delete")
+async def delete_tool(
+    tool_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this tool"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
+    """
+    Permanently deletes a tool by ID.
+
+    Args:
+        tool_id (str): The ID of the tool to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this tool.
+        db (Session): The database session dependency.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Dict[str, str]: A confirmation message upon successful deletion.
+
+    Raises:
+        HTTPException: If an error occurs during deletion.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is deleting tool with ID {tool_id}")
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        await tool_service.delete_tool(db, tool_id, user_email=user_email, purge_metrics=purge_metrics)
+        db.commit()
+        db.close()
+        return {"status": "success", "message": f"Tool {tool_id} permanently deleted"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ToolNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@tool_router.post("/{tool_id}/state")
+@require_permission("tools.update")
+async def set_tool_state(
+    tool_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Activates or deactivates a tool.
+
+    Args:
+        tool_id (str): The ID of the tool to update.
+        activate (bool): Whether to activate (`True`) or deactivate (`False`) the tool.
+        db (Session): The database session dependency.
+        user (str): The authenticated user making the request.
+
+    Returns:
+        Dict[str, Any]: The status, message, and updated tool data.
+
+    Raises:
+        HTTPException: If an error occurs during state change.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is setting tool state for ID {tool_id} to {'active' if activate else 'inactive'}")
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        tool = await tool_service.set_tool_state(db, tool_id, activate, reachable=activate, user_email=user_email)
+        return {
+            "status": "success",
+            "message": f"Tool {tool_id} {'activated' if activate else 'deactivated'}",
+            "tool": tool.model_dump(),
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ToolNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ToolLockConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@tool_router.post("/{tool_id}/toggle", deprecated=True)
+@require_permission("tools.update")
+async def toggle_tool_status(
+    tool_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """DEPRECATED: Use /state endpoint instead. This endpoint will be removed in a future release.
+
+    Activates or deactivates a tool.
+
+    Args:
+        tool_id: The tool ID.
+        activate: Whether to activate (True) or deactivate (False) the tool.
+        db: Database session.
+        user: Authenticated user context.
+
+    Returns:
+        Status message with tool state.
+    """
+
+    warnings.warn("The /toggle endpoint is deprecated. Use /state instead.", DeprecationWarning, stacklevel=2)
+    return await set_tool_state(tool_id, activate, db, user)
+
+
+#################
+# Resource APIs #
+#################
+# --- Resource templates endpoint - MUST come before variable paths ---
+@resource_router.get("/templates/list", response_model=ListResourceTemplatesResult)
+@require_permission("resources.read")
+async def list_resource_templates(
+    request: Request,
+    db: Session = Depends(get_db),
+    include_inactive: bool = False,
+    tags: Optional[str] = None,
+    visibility: Optional[str] = None,
+    user=Depends(get_current_user_with_permissions),
+) -> ListResourceTemplatesResult:
+    """
+    List all available resource templates.
+
+    Args:
+        request (Request): The FastAPI request object for team_id retrieval.
+        db (Session): Database session.
+        user (str): Authenticated user.
+        include_inactive (bool): Whether to include inactive resources.
+        tags (Optional[str]): Comma-separated list of tags to filter by.
+        visibility (Optional[str]): Filter by visibility (private, team, public).
+
+    Returns:
+        ListResourceTemplatesResult: A paginated list of resource templates.
+    """
+    logger.info(f"User {SecurityValidator.sanitize_log_message(str(user))} requested resource templates")
+
+    # Parse tags parameter if provided
+    tags_list = None
+    if tags:
+        tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+    # Get filtering context from token (respects token scope)
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+    # Admin bypass - only when token has NO team restrictions
+    if is_admin and token_teams is None:
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only
+
+    resource_templates = await resource_service.list_resource_templates(
+        db,
+        user_email=user_email,
+        token_teams=token_teams,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        visibility=visibility,
+    )
+    # For simplicity, we're not implementing real pagination here
+    return ListResourceTemplatesResult(_meta={}, resource_templates=resource_templates, next_cursor=None)  # No pagination for now
+
+
+@resource_router.post("/{resource_id}/state")
+@require_permission("resources.update")
+async def set_resource_state(
+    resource_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Activate or deactivate a resource by its ID.
+
+    Args:
+        resource_id (str): The ID of the resource.
+        activate (bool): True to activate, False to deactivate.
+        db (Session): Database session.
+        user (str): Authenticated user.
+
+    Returns:
+        Dict[str, Any]: Status message and updated resource data.
+
+    Raises:
+        HTTPException: If toggling fails.
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is toggling resource with ID {resource_id} to {'active' if activate else 'inactive'}")
+    try:
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        resource = await resource_service.set_resource_state(db, resource_id, activate, user_email=user_email)
+        return {
+            "status": "success",
+            "message": f"Resource {resource_id} {'activated' if activate else 'deactivated'}",
+            "resource": resource.model_dump(),
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ResourceNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ResourceLockConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@resource_router.post("/{resource_id}/toggle", deprecated=True)
+@require_permission("resources.update")
+async def toggle_resource_status(
+    resource_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """DEPRECATED: Use /state endpoint instead. This endpoint will be removed in a future release.
+
+    Activate or deactivate a resource by its ID.
+
+    Args:
+        resource_id: The resource ID.
+        activate: Whether to activate (True) or deactivate (False) the resource.
+        db: Database session.
+        user: Authenticated user context.
+
+    Returns:
+        Status message with resource state.
+    """
+
+    warnings.warn("The /toggle endpoint is deprecated. Use /state instead.", DeprecationWarning, stacklevel=2)
+    return await set_resource_state(resource_id, activate, db, user)
+
+
+@resource_router.get("", response_model=Union[List[ResourceRead], CursorPaginatedResourcesResponse])
+@resource_router.get("/", response_model=Union[List[ResourceRead], CursorPaginatedResourcesResponse])
+@require_permission("resources.read")
+async def list_resources(
+    request: Request,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of resources to return"),
+    include_inactive: bool = False,
+    tags: Optional[str] = None,
+    team_id: Optional[str] = None,
+    visibility: Optional[str] = None,
+    gateway_id: Optional[str] = Query(None, description="Filter by gateway ID"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Retrieve a list of resources accessible to the user, with team filtering and cursor pagination support.
+
+    Args:
+        request (Request): The FastAPI request object for team_id retrieval
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of resources to return.
+        include_inactive (bool): Whether to include inactive resources.
+        tags (Optional[str]): Comma-separated list of tags to filter by.
+        team_id (Optional[str]): Filter by specific team ID.
+        visibility (Optional[str]): Filter by visibility (private, team, public).
+        gateway_id (Optional[str]): Filter by gateway ID. Use 'null' for resources without a gateway.
+        db (Session): Database session.
+        user (str): Authenticated user.
+
+    Returns:
+        Union[List[ResourceRead], Dict[str, Any]]: List of resources or paginated response with nextCursor.
+    """
+    # Parse tags parameter if provided
+    tags_list = None
+    if tags:
+        tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+    # Get filtering context from token (respects token scope)
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even for admins), respect it for least-privilege
+    if is_admin and token_teams is None:
+        user_email = None
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
+    # Check team_id from request.state (set during auth)
+    token_team_id = getattr(request.state, "team_id", None)
+
+    # Check for team ID mismatch (only applies when both are specified and token has teams)
+    if team_id is not None and token_team_id is not None and team_id != token_team_id:
+        return ORJSONResponse(
+            content={"message": "Access issue: This API token does not have the required permissions for this team."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # For listing, only narrow by team_id when explicitly requested via query param.
+    # Do NOT auto-narrow to token's single team; token_teams handles visibility scoping.
+
+    # Use unified list_resources() with token-based team filtering
+    # Always apply visibility filtering based on token scope
+    logger.debug(
+        f"User {SecurityValidator.sanitize_log_message(user_email)} requested resource list with cursor {cursor}, include_inactive={include_inactive}, tags={tags_list}, team_id={team_id}, visibility={visibility}, gateway_id={gateway_id}"
+    )
+    data, next_cursor = await resource_service.list_resources(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        gateway_id=gateway_id,
+        user_email=user_email,
+        team_id=team_id,
+        visibility=visibility,
+        token_teams=token_teams,
+    )
+    # Release transaction before response serialization
+    db.commit()
+    db.close()
+
+    if include_pagination:
+        return CursorPaginatedResourcesResponse.model_construct(resources=data, next_cursor=next_cursor)
+    return data
+
+
+@resource_router.post("", response_model=ResourceRead)
+@resource_router.post("/", response_model=ResourceRead)
+@require_permission("resources.create")
+async def create_resource(
+    resource: ResourceCreate,
+    request: Request,
+    team_id: Optional[str] = Body(None, description="Team ID to assign resource to"),
+    visibility: Optional[str] = Body("public", description="Resource visibility: private, team, public"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ResourceRead:
+    """
+    Create a new resource.
+
+    Args:
+        resource (ResourceCreate): Data for the new resource.
+        request (Request): FastAPI request object for metadata extraction.
+        team_id (Optional[str]): Team ID to assign the resource to.
+        visibility (str): Resource visibility level (private, team, public).
+        db (Session): Database session.
+        user (str): Authenticated user.
+
+    Returns:
+        ResourceRead: The created resource.
+
+    Raises:
+        HTTPException: On conflict or validation errors or IntegrityError.
+    """
+    try:
+        # Extract metadata from request
+        metadata = MetadataCapture.extract_creation_metadata(request, user)
+
+        # Get user email and handle team assignment
+        user_email = get_user_email(user)
+
+        token_team_id = getattr(request.state, "team_id", None)
+        token_teams = getattr(request.state, "token_teams", None)
+
+        # SECURITY: Public-only tokens (teams == []) cannot create team/private resources
+        is_public_only_token = token_teams is not None and len(token_teams) == 0
+        if is_public_only_token and visibility in ("team", "private"):
+            return ORJSONResponse(
+                content={"message": "Public-only tokens cannot create team or private resources. Use visibility='public' or obtain a team-scoped token."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check for team ID mismatch (only for non-public-only tokens)
+        if not is_public_only_token and team_id is not None and token_team_id is not None and team_id != token_team_id:
+            return ORJSONResponse(
+                content={"message": "Access issue: This API token does not have the required permissions for this team."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Determine final team ID (public-only tokens get no team)
+        if is_public_only_token:
+            team_id = None
+        else:
+            team_id = team_id or token_team_id
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(user_email)} is creating a new resource for team {team_id}")
+        result = await resource_service.register_resource(
+            db,
+            resource,
+            created_by=metadata["created_by"],
+            created_from_ip=metadata["created_from_ip"],
+            created_via=metadata["created_via"],
+            created_user_agent=metadata["created_user_agent"],
+            import_batch_id=metadata["import_batch_id"],
+            federation_source=metadata["federation_source"],
+            team_id=team_id,
+            owner_email=user_email,
+            visibility=visibility,
+        )
+        db.commit()
+        db.close()
+        return result
+    except ResourceURIConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ResourceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValidationError as e:
+        # Handle validation errors from Pydantic
+        logger.error(f"Validation error while creating resource: {e}")
+        raise HTTPException(status_code=422, detail=ErrorFormatter.format_validation_error(e))
+    except IntegrityError as e:
+        logger.error(f"Integrity error while creating resource: {e}")
+        raise HTTPException(status_code=409, detail=ErrorFormatter.format_database_error(e))
+    except ContentSizeError as e:
+        logger.error(f"Content size exceeded in creating resource: {e}")
+        raise HTTPException(status_code=413, detail={"error": f"{e.content_type} size limit exceeded", "message": str(e), "actual_size": e.actual_size, "max_size": e.max_size})
+    except ContentTypeError as e:
+        logger.error(f"MIME type not allowed in creating resource: {e}")
+        raise HTTPException(status_code=415, detail={"error": "Unsupported Media Type", "message": str(e), "mime_type": e.mime_type, "allowed_types": e.allowed_types})
+
+
+@resource_router.get("/{resource_id}")
+@require_permission("resources.read")
+async def read_resource(resource_id: str, request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Any:
+    """
+    Read a resource by its ID with plugin support.
+
+    Args:
+        resource_id (str): ID of the resource.
+        request (Request): FastAPI request object for context.
+        db (Session): Database session.
+        user (str): Authenticated user.
+
+    Returns:
+        Any: The content of the resource.
+
+    Raises:
+        HTTPException: If the resource cannot be found or read.
+    """
+    # Get request ID from headers or generate one
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    server_id = request.headers.get("X-Server-ID")
+
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested resource with ID {resource_id} (request_id: {request_id})")
+
+    # NOTE: Removed endpoint-level cache to prevent authorization bypass
+    # The cache was checked before access control, allowing unauthorized users
+    # to access cached private resources. Service layer handles caching safely.
+
+    # Get plugin contexts from request.state for cross-hook sharing
+    plugin_context_table = getattr(request.state, "plugin_context_table", None)
+    plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
+    try:
+        # Extract user email and admin status for authorization
+        user_email = get_user_email(user)
+        is_admin = user.get("is_admin", False) if isinstance(user, dict) else False
+
+        # Admin bypass: pass user=None to trigger unrestricted access
+        # Non-admin: pass user_email and let service look up teams
+        auth_user_email = None if is_admin else user_email
+
+        # Call service with context for plugin support
+        content = await resource_service.read_resource(
+            db,
+            resource_id=resource_id,
+            request_id=request_id,
+            user=auth_user_email,
+            server_id=server_id,
+            token_teams=None,  # Admin: bypass; Non-admin: lookup teams
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+        )
+        _enforce_scoped_resource_access(request, db, user, f"/resources/{resource_id}")
+        # Release transaction before response serialization
+        db.commit()
+        db.close()
+    except (ResourceNotFoundError, ResourceError) as exc:
+        # Translate to FastAPI HTTP error
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    # NOTE: Removed cache.set() - see cache removal comment above
+    # Ensure a plain JSON-serializable structure
+    try:
+        # First-Party
+        from mcpgateway.common.models import ResourceContent, TextContent  # pylint: disable=import-outside-toplevel
+
+        # If already a ResourceContent, serialize directly
+        if isinstance(content, ResourceContent):
+            return content.model_dump()
+
+        # If TextContent, wrap into resource envelope with text
+        if isinstance(content, TextContent):
+            return {"type": "resource", "id": resource_id, "uri": content.uri, "text": content.text}
+    except Exception:
+        pass  # nosec B110 - Intentionally continue with fallback resource content handling
+
+    if isinstance(content, bytes):
+        return {"type": "resource", "id": resource_id, "uri": content.uri, "blob": content.decode("utf-8", errors="ignore")}
+    if isinstance(content, str):
+        return {"type": "resource", "id": resource_id, "uri": content.uri, "text": content}
+
+    # Objects with a 'text' attribute (e.g., mocks) – best-effort mapping
+    if hasattr(content, "text"):
+        return {"type": "resource", "id": resource_id, "uri": content.uri, "text": getattr(content, "text")}
+
+    return {"type": "resource", "id": resource_id, "uri": content.uri, "text": str(content)}
+
+
+@resource_router.get("/{resource_id}/info", response_model=ResourceRead)
+@require_permission("resources.read")
+async def get_resource_info(
+    resource_id: str,
+    request: Request,
+    include_inactive: bool = Query(False, description="Include inactive resources"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ResourceRead:
+    """
+    Get resource metadata by ID.
+
+    Returns the resource metadata including the enabled status. This endpoint
+    is different from GET /resources/{resource_id} which returns the resource content.
+
+    Args:
+        resource_id (str): ID of the resource.
+        request (Request): Incoming request context used for scope enforcement.
+        include_inactive (bool): Whether to include inactive resources.
+        db (Session): Database session.
+        user (str): Authenticated user.
+
+    Returns:
+        ResourceRead: The resource metadata including enabled status.
+
+    Raises:
+        HTTPException: If the resource is not found.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested resource info for ID {resource_id}")
+        result = await resource_service.get_resource_by_id(db, resource_id, include_inactive=include_inactive)
+        _enforce_scoped_resource_access(request, db, user, f"/resources/{resource_id}")
+        return result
+    except ResourceNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@resource_router.put("/{resource_id}", response_model=ResourceRead)
+@require_permission("resources.update")
+async def update_resource(
+    resource_id: str,
+    resource: ResourceUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> ResourceRead:
+    """
+    Update a resource identified by its ID.
+
+    Args:
+        resource_id (str): ID of the resource.
+        resource (ResourceUpdate): New resource data.
+        request (Request): The FastAPI request object for metadata extraction.
+        db (Session): Database session.
+        user (str): Authenticated user.
+
+    Returns:
+        ResourceRead: The updated resource.
+
+    Raises:
+        HTTPException: If the resource is not found or update fails.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is updating resource with ID {resource_id}")
+        # Extract modification metadata
+        mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)  # Version will be incremented in service
+
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        result = await resource_service.update_resource(
+            db,
+            resource_id,
+            resource,
+            modified_by=mod_metadata["modified_by"],
+            modified_from_ip=mod_metadata["modified_from_ip"],
+            modified_via=mod_metadata["modified_via"],
+            modified_user_agent=mod_metadata["modified_user_agent"],
+            user_email=user_email,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ResourceNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValidationError as e:
+        logger.error(f"Validation error while updating resource {resource_id}: {e}")
+        raise HTTPException(status_code=422, detail=ErrorFormatter.format_validation_error(e))
+    except IntegrityError as e:
+        logger.error(f"Integrity error while updating resource {resource_id}: {e}")
+        raise HTTPException(status_code=409, detail=ErrorFormatter.format_database_error(e))
+    except ResourceURIConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ContentSizeError as e:
+        logger.error(f"Content size exceeded in updating resource: {e}")
+        raise HTTPException(status_code=413, detail={"error": f"{e.content_type} size limit exceeded", "message": str(e), "actual_size": e.actual_size, "max_size": e.max_size})
+    except ContentTypeError as e:
+        logger.error(f"MIME type not allowed in updating resource: {e}")
+        raise HTTPException(status_code=415, detail={"error": "Unsupported Media Type", "message": str(e), "mime_type": e.mime_type, "allowed_types": e.allowed_types})
+    db.commit()
+    db.close()
+    await invalidate_resource_cache(resource_id)
+    return result
+
+
+@resource_router.delete("/{resource_id}")
+@require_permission("resources.delete")
+async def delete_resource(
+    resource_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this resource"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
+    """
+    Delete a resource by its ID.
+
+    Args:
+        resource_id (str): ID of the resource to delete.
+        purge_metrics (bool): Whether to delete raw + hourly rollup metrics for this resource.
+        db (Session): Database session.
+        user (str): Authenticated user.
+
+    Returns:
+        Dict[str, str]: Status message indicating deletion success.
+
+    Raises:
+        HTTPException: If the resource is not found or deletion fails.
+    """
+    try:
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is deleting resource with id {resource_id}")
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        await resource_service.delete_resource(db, resource_id, user_email=user_email, purge_metrics=purge_metrics)
+        db.commit()
+        db.close()
+        await invalidate_resource_cache(resource_id)
+        return {"status": "success", "message": f"Resource {resource_id} deleted"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ResourceNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ResourceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@resource_router.post("/subscribe")
+@require_permission("resources.read")
+async def subscribe_resource(request: Request, user=Depends(get_current_user_with_permissions)) -> StreamingResponse:
+    """
+    Subscribe to server-sent events (SSE) for a specific resource.
+
+    Args:
+        request (Request): Incoming HTTP request.
+        user (str): Authenticated user.
+
+    Returns:
+        StreamingResponse: A streaming response with event updates.
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is subscribing to resource")
+    user_email, token_teams = _get_scoped_resource_access_context(request, user)
+
+    async def sse_generator():
+        """Generate SSE-formatted events from resource subscription changes.
+
+        Yields:
+            str: SSE-formatted event data.
+        """
+        async for event in resource_service.subscribe_events(user_email=user_email, token_teams=token_teams):
+            yield f"data: {orjson.dumps(event).decode()}\n\n"
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+
+###############
+# Prompt APIs #
+###############
+@prompt_router.post("/{prompt_id}/state")
+@require_permission("prompts.update")
+async def set_prompt_state(
+    prompt_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Set the activation status of a prompt.
+
+    Args:
+        prompt_id: ID of the prompt to update.
+        activate: True to activate, False to deactivate.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Status message and updated prompt details.
+
+    Raises:
+        HTTPException: If the state change fails (e.g., prompt not found or database error); emitted with *400 Bad Request* status and an error message.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} requested state change for prompt {prompt_id}, activate={activate}")
+    try:
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        prompt = await prompt_service.set_prompt_state(db, prompt_id, activate, user_email=user_email)
+        return {
+            "status": "success",
+            "message": f"Prompt {prompt_id} {'activated' if activate else 'deactivated'}",
+            "prompt": prompt.model_dump(),
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except PromptNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except PromptLockConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@prompt_router.post("/{prompt_id}/toggle", deprecated=True)
+@require_permission("prompts.update")
+async def toggle_prompt_status(
+    prompt_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """DEPRECATED: Use /state endpoint instead. This endpoint will be removed in a future release.
+
+    Set the activation status of a prompt.
+
+    Args:
+        prompt_id: The prompt ID.
+        activate: Whether to activate (True) or deactivate (False) the prompt.
+        db: Database session.
+        user: Authenticated user context.
+
+    Returns:
+        Status message with prompt state.
+    """
+
+    warnings.warn("The /toggle endpoint is deprecated. Use /state instead.", DeprecationWarning, stacklevel=2)
+    return await set_prompt_state(prompt_id, activate, db, user)
+
+
+@prompt_router.get("", response_model=Union[List[PromptRead], CursorPaginatedPromptsResponse])
+@prompt_router.get("/", response_model=Union[List[PromptRead], CursorPaginatedPromptsResponse])
+@require_permission("prompts.read")
+async def list_prompts(
+    request: Request,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of prompts to return"),
+    include_inactive: bool = False,
+    tags: Optional[str] = None,
+    team_id: Optional[str] = None,
+    visibility: Optional[str] = None,
+    gateway_id: Optional[str] = Query(None, description="Filter by gateway ID"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    List prompts accessible to the user, with team filtering and cursor pagination support.
+
+    Args:
+        request (Request): The FastAPI request object for team_id retrieval
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of prompts to return.
+        include_inactive: Include inactive prompts.
+        tags: Comma-separated list of tags to filter by.
+        team_id: Filter by specific team ID.
+        visibility: Filter by visibility (private, team, public).
+        gateway_id: Filter by gateway ID. Use 'null' for prompts without a gateway.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Union[List[Dict[str, Any]], Dict[str, Any]]: List of prompt records or paginated response with nextCursor.
+    """
+    # Parse tags parameter if provided
+    tags_list = None
+    if tags:
+        tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+    # Get filtering context from token (respects token scope)
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+    # Admin bypass - only when token has NO team restrictions (token_teams is None)
+    # If token has explicit team scope (even for admins), respect it for least-privilege
+    if is_admin and token_teams is None:
+        user_email = None
+        token_teams = None  # Admin unrestricted
+    elif token_teams is None:
+        token_teams = []  # Non-admin without teams = public-only (secure default)
+
+    # Check team_id from request.state (set during auth)
+    token_team_id = getattr(request.state, "team_id", None)
+
+    # Check for team ID mismatch (only applies when both are specified and token has teams)
+    if team_id is not None and token_team_id is not None and team_id != token_team_id:
+        return ORJSONResponse(
+            content={"message": "Access issue: This API token does not have the required permissions for this team."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # For listing, only narrow by team_id when explicitly requested via query param.
+    # Do NOT auto-narrow to token's single team; token_teams handles visibility scoping.
+
+    # Use consolidated prompt listing with token-based team filtering
+    # Always apply visibility filtering based on token scope
+    logger.debug(
+        f"User: {SecurityValidator.sanitize_log_message(user_email)} requested prompt list with include_inactive={include_inactive}, cursor={cursor}, tags={tags_list}, team_id={team_id}, visibility={visibility}, gateway_id={gateway_id}"
+    )
+    data, next_cursor = await prompt_service.list_prompts(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        tags=tags_list,
+        gateway_id=gateway_id,
+        user_email=user_email,
+        team_id=team_id,
+        visibility=visibility,
+        token_teams=token_teams,
+    )
+    # Release transaction before response serialization
+    db.commit()
+    db.close()
+
+    if include_pagination:
+        return CursorPaginatedPromptsResponse.model_construct(prompts=data, next_cursor=next_cursor)
+    return data
+
+
+@prompt_router.post("", response_model=PromptRead)
+@prompt_router.post("/", response_model=PromptRead)
+@require_permission("prompts.create")
+async def create_prompt(
+    prompt: PromptCreate,
+    request: Request,
+    team_id: Optional[str] = Body(None, description="Team ID to assign prompt to"),
+    visibility: Optional[str] = Body("public", description="Prompt visibility: private, team, public"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> PromptRead:
+    """
+    Create a new prompt.
+
+    Args:
+        prompt (PromptCreate): Payload describing the prompt to create.
+        request (Request): The FastAPI request object for metadata extraction.
+        team_id (Optional[str]): Team ID to assign the prompt to.
+        visibility (str): Prompt visibility level (private, team, public).
+        db (Session): Active SQLAlchemy session.
+        user (str): Authenticated username.
+
+    Returns:
+        PromptRead: The newly-created prompt.
+
+    Raises:
+        HTTPException: * **409 Conflict** - another prompt with the same name already exists.
+            * **400 Bad Request** - validation or persistence error raised
+                by :pyclass:`~mcpgateway.services.prompt_service.PromptService`.
+    """
+    try:
+        # Extract metadata from request
+        metadata = MetadataCapture.extract_creation_metadata(request, user)
+
+        # Get user email and handle team assignment
+        user_email = get_user_email(user)
+
+        token_team_id = getattr(request.state, "team_id", None)
+        token_teams = getattr(request.state, "token_teams", None)
+
+        # SECURITY: Public-only tokens (teams == []) cannot create team/private resources
+        is_public_only_token = token_teams is not None and len(token_teams) == 0
+        if is_public_only_token and visibility in ("team", "private"):
+            return ORJSONResponse(
+                content={"message": "Public-only tokens cannot create team or private resources. Use visibility='public' or obtain a team-scoped token."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check for team ID mismatch (only for non-public-only tokens)
+        if not is_public_only_token and team_id is not None and token_team_id is not None and team_id != token_team_id:
+            return ORJSONResponse(
+                content={"message": "Access issue: This API token does not have the required permissions for this team."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Determine final team ID (public-only tokens get no team)
+        if is_public_only_token:
+            team_id = None
+        else:
+            team_id = team_id or token_team_id
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(user_email)} is creating a new prompt for team {team_id}")
+        result = await prompt_service.register_prompt(
+            db,
+            prompt,
+            created_by=metadata["created_by"],
+            created_from_ip=metadata["created_from_ip"],
+            created_via=metadata["created_via"],
+            created_user_agent=metadata["created_user_agent"],
+            import_batch_id=metadata["import_batch_id"],
+            federation_source=metadata["federation_source"],
+            team_id=team_id,
+            owner_email=user_email,
+            visibility=visibility,
+        )
+        db.commit()
+        db.close()
+        return result
+    except Exception as e:
+        if isinstance(e, PromptNameConflictError):
+            # If the prompt name already exists, return a 409 Conflict error
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        if isinstance(e, PromptError):
+            # If there is a general prompt error, return a 400 Bad Request error
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        if isinstance(e, ValidationError):
+            # If there is a validation error, return a 422 Unprocessable Entity error
+            logger.error(f"Validation error while creating prompt: {e}")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=ErrorFormatter.format_validation_error(e))
+        if isinstance(e, IntegrityError):
+            # If there is an integrity error, return a 409 Conflict error
+            logger.error(f"Integrity error while creating prompt: {e}")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=ErrorFormatter.format_database_error(e))
+        if isinstance(e, ContentSizeError):
+            logger.error(f"Content size exceeded in creating prompt: {e}")
+            raise HTTPException(status_code=413, detail={"error": f"{e.content_type} size limit exceeded", "message": str(e), "actual_size": e.actual_size, "max_size": e.max_size})
+        # For any other unexpected errors, return a 500 Internal Server Error
+        logger.error(f"Unexpected error while creating prompt: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while creating the prompt")
+
+
+@prompt_router.post("/{prompt_id}")
+@require_permission("prompts.read")
+async def get_prompt(
+    request: Request,
+    prompt_id: str,
+    args: Dict[str, str] = Body({}),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Any:
+    """Get a prompt by prompt_id with arguments.
+
+    This implements the prompts/get functionality from the MCP spec,
+    which requires a POST request with arguments in the body.
+
+
+    Args:
+        request: FastAPI request object.
+        prompt_id: ID of the prompt.
+        args: Template arguments.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Rendered prompt or metadata.
+
+    Raises:
+        Exception: Re-raised if not a handled exception type.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} requested prompt: {prompt_id} with args={args}")
+
+    # Get plugin contexts from request.state for cross-hook sharing
+    plugin_context_table = getattr(request.state, "plugin_context_table", None)
+    plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
+    # Extract user email, admin status, and server_id for authorization
+    user_email = get_user_email(user)
+    is_admin = user.get("is_admin", False) if isinstance(user, dict) else False
+    server_id = request.headers.get("X-Server-ID")
+
+    # Admin bypass: pass user=None to trigger unrestricted access
+    # Non-admin: pass user_email and let service look up teams
+    auth_user_email = None if is_admin else user_email
+
+    try:
+        PromptExecuteArgs(args=args)
+        result = await prompt_service.get_prompt(
+            db,
+            prompt_id,
+            args,
+            user=auth_user_email,
+            server_id=server_id,
+            token_teams=None,  # Admin: bypass; Non-admin: lookup teams
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+        )
+        logger.debug(f"Prompt execution successful for '{prompt_id}'")
+    except Exception as ex:
+        logger.error(f"Could not retrieve prompt {prompt_id}: {ex}")
+        if isinstance(ex, PluginViolationError):
+            # Return the actual plugin violation message
+            return ORJSONResponse(content={"message": ex.message, "details": str(ex.violation) if hasattr(ex, "violation") else None}, status_code=422)
+        if isinstance(ex, (ValueError, PromptError)):
+            # Return the actual error message
+            return ORJSONResponse(content={"message": str(ex)}, status_code=422)
+        raise
+
+    return result
+
+
+@prompt_router.get("/{prompt_id}")
+@require_permission("prompts.read")
+async def get_prompt_no_args(
+    request: Request,
+    prompt_id: str,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Any:
+    """Get a prompt by ID without arguments.
+
+    This endpoint is for convenience when no arguments are needed.
+
+    Args:
+        request: FastAPI request object.
+        prompt_id: The ID of the prompt to retrieve
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        The prompt template information
+
+    Raises:
+        HTTPException: 404 if prompt not found, 403 if permission denied.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} requested prompt: {prompt_id} with no arguments")
+
+    # Get plugin contexts from request.state for cross-hook sharing
+    plugin_context_table = getattr(request.state, "plugin_context_table", None)
+    plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
+    # Extract user email, admin status, and server_id for authorization
+    user_email = get_user_email(user)
+    is_admin = user.get("is_admin", False) if isinstance(user, dict) else False
+    server_id = request.headers.get("X-Server-ID")
+
+    # Admin bypass: pass user=None to trigger unrestricted access
+    # Non-admin: pass user_email and let service look up teams
+    auth_user_email = None if is_admin else user_email
+
+    try:
+        return await prompt_service.get_prompt(
+            db,
+            prompt_id,
+            {},
+            user=auth_user_email,
+            server_id=server_id,
+            token_teams=None,  # Admin: bypass; Non-admin: lookup teams
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+        )
+    except PromptNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except PromptError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@prompt_router.put("/{prompt_id}", response_model=PromptRead)
+@require_permission("prompts.update")
+async def update_prompt(
+    prompt_id: str,
+    prompt: PromptUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> PromptRead:
+    """
+    Update (overwrite) an existing prompt definition.
+
+    Args:
+        prompt_id (str): Identifier of the prompt to update.
+        prompt (PromptUpdate): New prompt content and metadata.
+        request (Request): The FastAPI request object for metadata extraction.
+        db (Session): Active SQLAlchemy session.
+        user (str): Authenticated username.
+
+    Returns:
+        PromptRead: The updated prompt object.
+
+    Raises:
+        HTTPException: * **409 Conflict** - a different prompt with the same *name* already exists and is still active.
+            * **400 Bad Request** - validation or persistence error raised by :pyclass:`~mcpgateway.services.prompt_service.PromptService`.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} requested to update prompt: {prompt_id} with data={prompt}")
+    try:
+        # Extract modification metadata
+        mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)  # Version will be incremented in service
+
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        result = await prompt_service.update_prompt(
+            db,
+            prompt_id,
+            prompt,
+            modified_by=mod_metadata["modified_by"],
+            modified_from_ip=mod_metadata["modified_from_ip"],
+            modified_via=mod_metadata["modified_via"],
+            modified_user_agent=mod_metadata["modified_user_agent"],
+            user_email=user_email,
+        )
+        db.commit()
+        db.close()
+        return result
+    except Exception as e:
+        if isinstance(e, PermissionError):
+            raise HTTPException(status_code=403, detail=str(e))
+        if isinstance(e, PromptNotFoundError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        if isinstance(e, ValidationError):
+            logger.error(f"Validation error while updating prompt: {e}")
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=ErrorFormatter.format_validation_error(e))
+        if isinstance(e, IntegrityError):
+            logger.error(f"Integrity error while updating prompt: {e}")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=ErrorFormatter.format_database_error(e))
+        if isinstance(e, PromptNameConflictError):
+            # If the prompt name already exists, return a 409 Conflict error
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        if isinstance(e, PromptError):
+            # If there is a general prompt error, return a 400 Bad Request error
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        if isinstance(e, ContentSizeError):
+            logger.error(f"Content size exceeded in updating prompt: {e}")
+            raise HTTPException(status_code=413, detail={"error": f"{e.content_type} size limit exceeded", "message": str(e), "actual_size": e.actual_size, "max_size": e.max_size})
+        # For any other unexpected errors, return a 500 Internal Server Error
+        logger.error(f"Unexpected error while updating prompt: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while updating the prompt")
+
+
+@prompt_router.delete("/{prompt_id}")
+@require_permission("prompts.delete")
+async def delete_prompt(
+    prompt_id: str,
+    purge_metrics: bool = Query(False, description="Purge raw + rollup metrics for this prompt"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
+    """
+    Delete a prompt by ID.
+
+    Args:
+        prompt_id: ID of the prompt.
+        purge_metrics: Whether to delete raw + hourly rollup metrics for this prompt.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Status message.
+
+    Raises:
+        HTTPException: If the prompt is not found, a prompt error occurs, or an unexpected error occurs during deletion.
+    """
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(str(user))} requested deletion of prompt {prompt_id}")
+    try:
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        await prompt_service.delete_prompt(db, prompt_id, user_email=user_email, purge_metrics=purge_metrics)
+        db.commit()
+        db.close()
+        return {"status": "success", "message": f"Prompt {prompt_id} deleted"}
+    except Exception as e:
+        if isinstance(e, PermissionError):
+            raise HTTPException(status_code=403, detail=str(e))
+        if isinstance(e, PromptNotFoundError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        if isinstance(e, PromptError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        logger.error(f"Unexpected error while deleting prompt {prompt_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while deleting the prompt")
+
+    # except PromptNotFoundError as e:
+    #     return {"status": "error", "message": str(e)}
+    # except PromptError as e:
+    #     return {"status": "error", "message": str(e)}
+
+
+################
+# Gateway APIs #
+################
+@gateway_router.post("/{gateway_id}/state")
+@require_permission("gateways.update")
+async def set_gateway_state(
+    gateway_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Set the activation status of a gateway.
+
+    Args:
+        gateway_id (str): String ID of the gateway to update.
+        activate (bool): ``True`` to activate, ``False`` to deactivate.
+        db (Session): Active SQLAlchemy session.
+        user (str): Authenticated username.
+
+    Returns:
+        Dict[str, Any]: A dict containing the operation status, a message, and the updated gateway object.
+
+    Raises:
+        HTTPException: Returned with **400 Bad Request** if the state change fails (e.g., the gateway does not exist or the database raises an unexpected error).
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested state change for gateway {gateway_id}, activate={activate}")
+    try:
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        gateway = await gateway_service.set_gateway_state(
+            db,
+            gateway_id,
+            activate,
+            user_email=user_email,
+        )
+        return {
+            "status": "success",
+            "message": f"Gateway {gateway_id} {'activated' if activate else 'deactivated'}",
+            "gateway": gateway.model_dump(),
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@gateway_router.post("/{gateway_id}/toggle", deprecated=True)
+@require_permission("gateways.update")
+async def toggle_gateway_status(
+    gateway_id: str,
+    activate: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """DEPRECATED: Use /state endpoint instead. This endpoint will be removed in a future release.
+
+    Set the activation status of a gateway.
+
+    Args:
+        gateway_id: The gateway ID.
+        activate: Whether to activate (True) or deactivate (False) the gateway.
+        db: Database session.
+        user: Authenticated user context.
+
+    Returns:
+        Status message with gateway state.
+    """
+
+    warnings.warn("The /toggle endpoint is deprecated. Use /state instead.", DeprecationWarning, stacklevel=2)
+    return await set_gateway_state(gateway_id, activate, db, user)
+
+
+@gateway_router.get("", response_model=Union[List[GatewayRead], CursorPaginatedGatewaysResponse])
+@gateway_router.get("/", response_model=Union[List[GatewayRead], CursorPaginatedGatewaysResponse])
+@require_permission("gateways.read")
+async def list_gateways(
+    request: Request,
+    cursor: Optional[str] = Query(None, description="Cursor for pagination"),
+    include_pagination: bool = Query(False, description="Include cursor pagination metadata in response"),
+    limit: Optional[int] = Query(None, ge=0, description="Maximum number of gateways to return"),
+    include_inactive: bool = False,
+    team_id: Optional[str] = Query(None, description="Filter by team ID"),
+    visibility: Optional[str] = Query(None, description="Filter by visibility: private, team, public"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Union[List[GatewayRead], Dict[str, Any]]:
+    """
+    List all gateways with cursor pagination support.
+
+    Args:
+        request (Request): The FastAPI request object for team_id retrieval
+        cursor (Optional[str]): Cursor for pagination.
+        include_pagination (bool): Include cursor pagination metadata in response.
+        limit (Optional[int]): Maximum number of gateways to return.
+        include_inactive: Include inactive gateways.
+        team_id (Optional): Filter by specific team ID.
+        visibility (Optional): Filter by visibility (private, team, public).
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Union[List[GatewayRead], Dict[str, Any]]: List of gateway records or paginated response with nextCursor.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested list of gateways with include_inactive={include_inactive}")
+
+    user_email = get_user_email(user)
+
+    # Check team_id from token
+    token_team_id = getattr(request.state, "team_id", None)
+    token_teams = getattr(request.state, "token_teams", None)
+
+    # Check for team ID mismatch
+    if team_id is not None and token_team_id is not None and team_id != token_team_id:
+        return ORJSONResponse(
+            content={"message": "Access issue: This API token does not have the required permissions for this team."},
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # For listing, only narrow by team_id when explicitly requested via query param.
+    # Do NOT auto-narrow to token's single team; token_teams handles visibility scoping.
+
+    # SECURITY: token_teams is normalized in auth.py:
+    # - None: admin bypass (is_admin=true with explicit null teams) - sees ALL resources
+    # - []: public-only (missing teams or explicit empty) - sees only public
+    # - [...]: team-scoped - sees public + teams + user's private
+    is_admin_bypass = token_teams is None
+    is_public_only_token = token_teams is not None and len(token_teams) == 0
+
+    # Use consolidated gateway listing with optional team filtering
+    # For admin bypass: pass user_email=None and token_teams=None to skip all filtering
+    logger.debug(f"User: {SecurityValidator.sanitize_log_message(user_email)} requested gateway list with include_inactive={include_inactive}, team_id={team_id}, visibility={visibility}")
+    data, next_cursor = await gateway_service.list_gateways(
+        db=db,
+        cursor=cursor,
+        limit=limit,
+        include_inactive=include_inactive,
+        user_email=None if is_admin_bypass else user_email,  # Admin bypass: no user filtering
+        team_id=team_id,
+        visibility="public" if is_public_only_token and not visibility else visibility,
+        token_teams=token_teams,  # None = admin bypass, [] = public-only, [...] = team-scoped
+    )
+    # Release transaction before response serialization
+    db.commit()
+    db.close()
+
+    if include_pagination:
+        return CursorPaginatedGatewaysResponse.model_construct(gateways=data, next_cursor=next_cursor)
+    return data
+
+
+@gateway_router.post("", response_model=GatewayRead)
+@gateway_router.post("/", response_model=GatewayRead)
+@require_permission("gateways.create")
+async def register_gateway(
+    gateway: GatewayCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Union[GatewayRead, JSONResponse]:
+    """
+    Register a new gateway.
+
+    Args:
+        gateway: Gateway creation data.
+        request: The FastAPI request object for metadata extraction.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Created gateway.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested to register gateway: {gateway}")
+    try:
+        # Extract metadata from request
+        metadata = MetadataCapture.extract_creation_metadata(request, user)
+
+        # Get user email and handle team assignment
+        user_email = get_user_email(user)
+
+        token_team_id = getattr(request.state, "team_id", None)
+        token_teams = getattr(request.state, "token_teams", None)
+        gateway_team_id = gateway.team_id
+        visibility = gateway.visibility
+
+        # SECURITY: Public-only tokens (teams == []) cannot create team/private resources
+        is_public_only_token = token_teams is not None and len(token_teams) == 0
+        if is_public_only_token and visibility in ("team", "private"):
+            return ORJSONResponse(
+                content={"message": "Public-only tokens cannot create team or private resources. Use visibility='public' or obtain a team-scoped token."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Check for team ID mismatch (only for non-public-only tokens)
+        if not is_public_only_token and gateway_team_id is not None and token_team_id is not None and gateway_team_id != token_team_id:
+            return ORJSONResponse(
+                content={"message": "Access issue: This API token does not have the required permissions for this team."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Determine final team ID (public-only tokens get no team)
+        if is_public_only_token:
+            team_id = None
+        else:
+            team_id = gateway_team_id or token_team_id
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(user_email)} is creating a new gateway for team {team_id}")
+
+        return await gateway_service.register_gateway(
+            db,
+            gateway,
+            created_by=metadata["created_by"],
+            created_from_ip=metadata["created_from_ip"],
+            created_via=metadata["created_via"],
+            created_user_agent=metadata["created_user_agent"],
+            team_id=team_id,
+            owner_email=user_email,
+            visibility=visibility,
+        )
+    except Exception as ex:
+        if isinstance(ex, GatewayConnectionError):
+            return ORJSONResponse(content={"message": str(ex)}, status_code=status.HTTP_502_BAD_GATEWAY)
+        if isinstance(ex, ValueError):
+            return ORJSONResponse(content={"message": "Unable to process input"}, status_code=status.HTTP_400_BAD_REQUEST)
+        if isinstance(ex, GatewayNameConflictError):
+            return ORJSONResponse(content={"message": "Gateway name already exists"}, status_code=status.HTTP_409_CONFLICT)
+        if isinstance(ex, GatewayDuplicateConflictError):
+            return ORJSONResponse(content={"message": "Gateway already exists"}, status_code=status.HTTP_409_CONFLICT)
+        if isinstance(ex, RuntimeError):
+            return ORJSONResponse(content={"message": "Error during execution"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if isinstance(ex, ValidationError):
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if isinstance(ex, IntegrityError):
+            return ORJSONResponse(status_code=status.HTTP_409_CONFLICT, content=ErrorFormatter.format_database_error(ex))
+        return ORJSONResponse(content={"message": "Unexpected error"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@gateway_router.get("/{gateway_id}", response_model=GatewayRead)
+@require_permission("gateways.read")
+async def get_gateway(gateway_id: str, request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Union[GatewayRead, JSONResponse]:
+    """
+    Retrieve a gateway by ID.
+
+    Args:
+        gateway_id: ID of the gateway.
+        request: Incoming request used for scoped access validation.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Gateway data.
+
+    Raises:
+        HTTPException: 404 if gateway not found.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested gateway {gateway_id}")
+    try:
+        gateway = await gateway_service.get_gateway(db, gateway_id)
+        _enforce_scoped_resource_access(request, db, user, f"/gateways/{gateway_id}")
+        return gateway
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@gateway_router.put("/{gateway_id}", response_model=GatewayRead)
+@require_permission("gateways.update")
+async def update_gateway(
+    gateway_id: str,
+    gateway: GatewayUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Union[GatewayRead, JSONResponse]:
+    """
+    Update a gateway.
+
+    Args:
+        gateway_id: Gateway ID.
+        gateway: Gateway update data.
+        request (Request): The FastAPI request object for metadata extraction.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Updated gateway.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested update on gateway {gateway_id} with data={gateway}")
+    try:
+        # Extract modification metadata
+        mod_metadata = MetadataCapture.extract_modification_metadata(request, user, 0)  # Version will be incremented in service
+
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        result = await gateway_service.update_gateway(
+            db,
+            gateway_id,
+            gateway,
+            modified_by=mod_metadata["modified_by"],
+            modified_from_ip=mod_metadata["modified_from_ip"],
+            modified_via=mod_metadata["modified_via"],
+            modified_user_agent=mod_metadata["modified_user_agent"],
+            user_email=user_email,
+        )
+        db.commit()
+        db.close()
+        return result
+    except Exception as ex:
+        if isinstance(ex, PermissionError):
+            return ORJSONResponse(content={"message": str(ex)}, status_code=403)
+        if isinstance(ex, GatewayNotFoundError):
+            return ORJSONResponse(content={"message": "Gateway not found"}, status_code=status.HTTP_404_NOT_FOUND)
+        if isinstance(ex, GatewayConnectionError):
+            return ORJSONResponse(content={"message": str(ex)}, status_code=status.HTTP_502_BAD_GATEWAY)
+        if isinstance(ex, ValueError):
+            return ORJSONResponse(content={"message": "Unable to process input"}, status_code=status.HTTP_400_BAD_REQUEST)
+        if isinstance(ex, GatewayNameConflictError):
+            return ORJSONResponse(content={"message": "Gateway name already exists"}, status_code=status.HTTP_409_CONFLICT)
+        if isinstance(ex, GatewayDuplicateConflictError):
+            return ORJSONResponse(content={"message": "Gateway already exists"}, status_code=status.HTTP_409_CONFLICT)
+        if isinstance(ex, RuntimeError):
+            return ORJSONResponse(content={"message": "Error during execution"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if isinstance(ex, ValidationError):
+            return ORJSONResponse(content=ErrorFormatter.format_validation_error(ex), status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        if isinstance(ex, IntegrityError):
+            return ORJSONResponse(status_code=status.HTTP_409_CONFLICT, content=ErrorFormatter.format_database_error(ex))
+        return ORJSONResponse(content={"message": "Unexpected error"}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@gateway_router.delete("/{gateway_id}")
+@require_permission("gateways.delete")
+async def delete_gateway(gateway_id: str, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> Dict[str, str]:
+    """
+    Delete a gateway by ID.
+
+    Args:
+        gateway_id: ID of the gateway.
+        db: Database session.
+        user: Authenticated user.
+
+    Returns:
+        Status message.
+
+    Raises:
+        HTTPException: If permission denied (403), gateway not found (404), or other gateway error (400).
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested deletion of gateway {gateway_id}")
+    try:
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        current = await gateway_service.get_gateway(db, gateway_id)
+        has_resources = bool(current.capabilities.get("resources"))
+        await gateway_service.delete_gateway(db, gateway_id, user_email=user_email)
+
+        # If the gateway had resources and was successfully deleted, invalidate
+        # the whole resource cache. This is needed since the cache holds both
+        # individual resources and the full listing which will also need to be
+        # invalidated.
+        if has_resources:
+            await invalidate_resource_cache()
+
+        db.commit()
+        db.close()
+        return {"status": "success", "message": f"Gateway {gateway_id} deleted"}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except GatewayError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@gateway_router.post("/{gateway_id}/tools/refresh", response_model=GatewayRefreshResponse)
+@require_permission("gateways.update")
+async def refresh_gateway_tools(
+    gateway_id: str,
+    request: Request,
+    include_resources: bool = Query(False, description="Include resources in refresh"),
+    include_prompts: bool = Query(False, description="Include prompts in refresh"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> GatewayRefreshResponse:
+    """
+    Manually trigger a refresh of tools/resources/prompts from a gateway's MCP server.
+
+    This endpoint forces an immediate re-discovery of tools, resources, and prompts
+    from the specified gateway. It returns counts of added, updated, and removed items,
+    along with any validation errors encountered.
+
+    Args:
+        gateway_id: ID of the gateway to refresh.
+        request: The FastAPI request object.
+        include_resources: Whether to include resources in the refresh.
+        include_prompts: Whether to include prompts in the refresh.
+        db: Database session used to validate gateway access.
+        user: Authenticated user.
+
+    Returns:
+        GatewayRefreshResponse with counts of changes and any validation errors.
+
+    Raises:
+        HTTPException: 404 if gateway not found, 409 if refresh already in progress.
+    """
+    logger.info(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested manual refresh for gateway {gateway_id}")
+    try:
+        await gateway_service.get_gateway(db, gateway_id)
+        _enforce_scoped_resource_access(request, db, user, f"/gateways/{gateway_id}")
+
+        user_email = user.get("email") if isinstance(user, dict) else str(user)
+        result = await gateway_service.refresh_gateway_manually(
+            gateway_id=gateway_id,
+            include_resources=include_resources,
+            include_prompts=include_prompts,
+            user_email=user_email,
+            request_headers=dict(request.headers),
+        )
+        return GatewayRefreshResponse(gateway_id=gateway_id, **result)
+    except GatewayNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except GatewayError as e:
+        # 409 Conflict for concurrent refresh attempts
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+##############
+# Root APIs  #
+##############
+@root_router.get("", response_model=List[Root])
+@root_router.get("/", response_model=List[Root])
+@require_permission("admin.system_config")
+async def list_roots(
+    user=Depends(get_current_user_with_permissions),
+) -> List[Root]:
+    """
+    Retrieve a list of all registered roots.
+
+    Args:
+        user: Authenticated user.
+
+    Returns:
+        List of Root objects.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested list of roots")
+    return await root_service.list_roots()
+
+
+@root_router.get("/export", response_model=Dict[str, Any])
+@require_permission("admin.system_config")
+async def export_root(
+    uri: str,
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Export a single root configuration to JSON format.
+
+    Args:
+        uri: Root URI to export (query parameter)
+        user: Authenticated user
+
+    Returns:
+        Export data containing root information
+
+    Raises:
+        HTTPException: If root not found or export fails
+    """
+    try:
+        logger.info(f"User {SecurityValidator.sanitize_log_message(str(user))} requested root export for URI: {uri}")
+
+        # Extract username from user
+        username: Optional[str] = None
+        if hasattr(user, "email"):
+            username = getattr(user, "email", None)
+        elif isinstance(user, dict):
+            username = user.get("email", None)
+        else:
+            username = None
+
+        # Get the root by URI
+        root = await root_service.get_root_by_uri(uri)
+
+        # Create export data
+        export_data = {
+            "exported_at": datetime.now().isoformat(),
+            "exported_by": username or "unknown",
+            "export_type": "root",
+            "version": "1.0",
+            "root": {
+                "uri": str(root.uri),
+                "name": root.name,
+            },
+        }
+
+        return export_data
+
+    except RootServiceNotFoundError as e:
+        logger.error(f"Root not found for export by user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected root export error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Root export failed: {str(e)}")
+
+
+@root_router.get("/changes")
+@require_permission("admin.system_config")
+async def subscribe_roots_changes(
+    user=Depends(get_current_user_with_permissions),
+) -> StreamingResponse:
+    """
+    Subscribe to real-time changes in root list via Server-Sent Events (SSE).
+
+    Args:
+        user: Authenticated user.
+
+    Returns:
+        StreamingResponse with event-stream media type.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' subscribed to root changes stream")
+
+    async def generate_events():
+        """Generate SSE-formatted events from root service changes.
+
+        Yields:
+            str: SSE-formatted event data.
+        """
+        async for event in root_service.subscribe_changes():
+            yield f"data: {orjson.dumps(event).decode()}\n\n"
+
+    return StreamingResponse(generate_events(), media_type="text/event-stream")
+
+
+@root_router.get("/{root_uri:path}", response_model=Root)
+@require_permission("admin.system_config")
+async def get_root_by_uri(
+    root_uri: str,
+    user=Depends(get_current_user_with_permissions),
+) -> Root:
+    """
+    Retrieve a specific root by its URI.
+
+    Args:
+        root_uri: URI of the root to retrieve.
+        user: Authenticated user.
+
+    Returns:
+        Root object.
+
+    Raises:
+        HTTPException: If the root is not found.
+        Exception: For any other unexpected errors.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested root with URI: {root_uri}")
+    try:
+        root = await root_service.get_root_by_uri(root_uri)
+        return root
+    except RootServiceNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error getting root {root_uri}: {e}")
+        raise e
+
+
+@root_router.post("", response_model=Root)
+@root_router.post("/", response_model=Root)
+@require_permission("admin.system_config")
+async def add_root(
+    root: Root,  # Accept JSON body using the Root model from models.py
+    user=Depends(get_current_user_with_permissions),
+) -> Root:
+    """
+    Add a new root.
+
+    Args:
+        root: Root object containing URI and name.
+        user: Authenticated user.
+
+    Returns:
+        The added Root object.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested to add root: {root}")
+    return await root_service.add_root(str(root.uri), root.name)
+
+
+@root_router.put("/{root_uri:path}", response_model=Root)
+@require_permission("admin.system_config")
+async def update_root(
+    root_uri: str,
+    root: Root,
+    user=Depends(get_current_user_with_permissions),
+) -> Root:
+    """
+    Update a root by URI.
+
+    Args:
+        root_uri: URI of the root to update.
+        root: Root object with updated information.
+        user: Authenticated user.
+
+    Returns:
+        Updated Root object.
+
+    Raises:
+        HTTPException: If the root is not found.
+        Exception: For any other unexpected errors.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested to update root with URI: {root_uri}")
+    try:
+        root = await root_service.update_root(root_uri, root.name)
+        return root
+    except RootServiceNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error updating root {root_uri}: {e}")
+        raise e
+
+
+@root_router.delete("/{uri:path}")
+@require_permission("admin.system_config")
+async def remove_root(
+    uri: str,
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, str]:
+    """
+    Remove a registered root by URI.
+
+    Args:
+        uri: URI of the root to remove.
+        user: Authenticated user.
+
+    Returns:
+        Status message indicating result.
+    """
+    logger.debug(f"User '{SecurityValidator.sanitize_log_message(str(user))}' requested to remove root with URI: {uri}")
+    await root_service.remove_root(uri)
+    return {"status": "success", "message": f"Root {uri} removed"}
+
+
+##################
+# Utility Routes #
+##################
+@utility_router.post("/rpc/")
+@utility_router.post("/rpc")
+async def handle_rpc(request: Request, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)):
+    """Handle authenticated public RPC requests.
+
+    Args:
+        request: Incoming public RPC request.
+        db: Database session provided by dependency injection.
+        user: Authenticated user payload with permissions.
+
+    Returns:
+        JSON-RPC response generated by the shared authenticated RPC dispatcher.
+    """
+    return await _handle_rpc_authenticated(request, db=db, user=user)
+
+
+@utility_router.post("/_internal/mcp/authenticate/")
+@utility_router.post("/_internal/mcp/authenticate")
+async def handle_internal_mcp_authenticate(request: Request):
+    """Authenticate a public MCP request for direct Rust ingress.
+
+    Args:
+        request: Trusted internal request sent by the local Rust runtime.
+
+    Returns:
+        Auth context payload that Rust can forward on subsequent internal MCP calls.
+
+    Raises:
+        HTTPException: If the request is not trusted or the forwarded payload is invalid.
+    """
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        raise HTTPException(status_code=403, detail="Internal MCP authenticate is only available to the local Rust runtime")
+
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid internal MCP authenticate payload")
+
+    method = str(payload.get("method") or "GET").upper()
+    path = payload.get("path")
+    query_string = payload.get("queryString", "")
+    forwarded_headers = payload.get("headers", {})
+    client_ip = payload.get("clientIp")
+
+    if not isinstance(path, str) or not path:
+        raise HTTPException(status_code=400, detail="Internal MCP authenticate payload requires path")
+    if not isinstance(query_string, str):
+        raise HTTPException(status_code=400, detail="Internal MCP authenticate payload queryString must be a string")
+    if not isinstance(forwarded_headers, dict) or not all(isinstance(name, str) and isinstance(value, str) for name, value in forwarded_headers.items()):
+        raise HTTPException(status_code=400, detail="Internal MCP authenticate payload headers must be a string map")
+    if client_ip is not None and not isinstance(client_ip, str):
+        raise HTTPException(status_code=400, detail="Internal MCP authenticate payload clientIp must be a string")
+
+    error_response, auth_context = await _run_internal_mcp_authentication(
+        method=method,
+        path=path,
+        query_string=query_string,
+        headers=forwarded_headers,
+        client_ip=client_ip,
+    )
+    if error_response is not None:
+        return error_response
+
+    return ORJSONResponse(status_code=200, content={"authContext": auth_context})
+
+
+@utility_router.post("/_internal/mcp/rpc/")
+@utility_router.post("/_internal/mcp/rpc")
+async def handle_internal_mcp_rpc(request: Request):
+    """Handle trusted MCP dispatch forwarded from the local Rust runtime.
+
+    Args:
+        request: Trusted internal MCP request from the Rust runtime.
+
+    Returns:
+        JSON-RPC response from the shared authenticated RPC dispatcher.
+
+    Raises:
+        Exception: Propagated after rolling back the local database session.
+    """
+    user = _build_internal_mcp_forwarded_user(request)
+    db = SessionLocal()
+    try:
+        response = await _handle_rpc_authenticated(request, db=db, user=user)
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return response
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/initialize/")
+@utility_router.post("/_internal/mcp/initialize")
+async def handle_internal_mcp_initialize(request: Request):
+    """Handle trusted MCP initialize requests forwarded from the local Rust runtime.
+
+    Args:
+        request: Trusted internal MCP initialize request.
+
+    Returns:
+        JSON-RPC initialize response payload.
+    """
+    user = _build_internal_mcp_forwarded_user(request)
+    req_id = None
+    try:
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id")
+        if req_id is None:
+            req_id = str(uuid.uuid4())
+
+        if body.get("method") != "initialize":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+        else:
+            server_id = params.get("server_id")
+
+        result = await _execute_rpc_initialize(
+            request,
+            user,
+            params=params,
+            server_id=server_id,
+            mcp_session_id=request.headers.get("mcp-session-id") or request.headers.get("x-mcp-session-id"),
+        )
+        return ORJSONResponse(content={"jsonrpc": "2.0", "result": result, "id": req_id})
+    except JSONRPCError as exc:
+        error = exc.to_dict()
+        return ORJSONResponse(content={"jsonrpc": "2.0", "error": error["error"], "id": req_id})
+    except Exception as exc:
+        logger.error("Internal MCP initialize error: %s", exc)
+        return ORJSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "Internal error", "data": str(exc)},
+                "id": req_id,
+            }
+        )
+
+
+@utility_router.delete("/_internal/mcp/session/")
+@utility_router.delete("/_internal/mcp/session")
+async def handle_internal_mcp_session_delete(request: Request):
+    """Handle trusted MCP session teardown forwarded from the local Rust runtime.
+
+    Args:
+        request: Trusted internal MCP session-delete request.
+
+    Returns:
+        Empty HTTP response indicating the session was removed.
+    """
+    _build_internal_mcp_forwarded_user(request)
+    auth_context = _get_internal_mcp_auth_context(request) or {}
+    mcp_session_id = request.headers.get("mcp-session-id") or request.headers.get("x-mcp-session-id")
+    if not mcp_session_id:
+        return ORJSONResponse(status_code=400, content={"detail": "mcp-session-id header is required"})
+
+    if auth_context.get("_rust_session_validated") is not True:
+        session_allowed, deny_status, deny_detail = await _validate_streamable_session_access(
+            mcp_session_id=mcp_session_id,
+            user_context=auth_context,
+        )
+        if not session_allowed:
+            return ORJSONResponse(status_code=deny_status, content={"detail": deny_detail})
+
+    server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+    if server_id:
+        _enforce_internal_mcp_server_scope(request, server_id)
+
+    await session_registry.remove_session(mcp_session_id)
+
+    if settings.mcpgateway_session_affinity_enabled:
+        try:
+            # First-Party
+            from mcpgateway.services.session_affinity import get_session_affinity  # pylint: disable=import-outside-toplevel
+
+            pool = get_session_affinity()
+            await pool.cleanup_session_owner(mcp_session_id)
+        except RuntimeError:
+            pass
+
+    return Response(status_code=204)
+
+
+@utility_router.post("/_internal/mcp/notifications/initialized/")
+@utility_router.post("/_internal/mcp/notifications/initialized")
+async def handle_internal_mcp_notifications_initialized(request: Request):
+    """Handle trusted MCP notifications/initialized requests from the local Rust runtime.
+
+    Args:
+        request: Trusted internal MCP notification request.
+
+    Returns:
+        Empty HTTP response acknowledging the notification.
+
+    Raises:
+        HTTPException: If trusted server-scope validation fails.
+    """
+    _build_internal_mcp_forwarded_user(request)
+    req_id = None
+    try:
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id")
+        if body.get("method") != "notifications/initialized":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+
+        logger.info("Client initialized")
+        await logging_service.notify("Client initialized", LogLevel.INFO)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Internal MCP notifications/initialized error: %s", exc)
+        return ORJSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "Internal error", "data": str(exc)},
+                "id": req_id,
+            }
+        )
+
+
+@utility_router.post("/_internal/mcp/notifications/message/")
+@utility_router.post("/_internal/mcp/notifications/message")
+async def handle_internal_mcp_notifications_message(request: Request):
+    """Handle trusted MCP notifications/message requests from the local Rust runtime.
+
+    Args:
+        request: Trusted internal MCP notification request.
+
+    Returns:
+        Empty HTTP response acknowledging the notification.
+
+    Raises:
+        HTTPException: If trusted server-scope validation fails.
+    """
+    _build_internal_mcp_forwarded_user(request)
+    req_id = None
+    try:
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id")
+        if body.get("method") != "notifications/message":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        await logging_service.notify(
+            params.get("data"),
+            LogLevel(params.get("level", "info")),
+            params.get("logger"),
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Internal MCP notifications/message error: %s", exc)
+        return ORJSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "Internal error", "data": str(exc)},
+                "id": req_id,
+            }
+        )
+
+
+@utility_router.post("/_internal/mcp/notifications/cancelled/")
+@utility_router.post("/_internal/mcp/notifications/cancelled")
+async def handle_internal_mcp_notifications_cancelled(request: Request):
+    """Handle trusted MCP notifications/cancelled requests from the local Rust runtime.
+
+    Args:
+        request: Trusted internal MCP cancellation notification.
+
+    Returns:
+        Empty HTTP response acknowledging the cancellation.
+
+    Raises:
+        HTTPException: If cancellation authorization or trusted scope validation fails.
+    """
+    user = _build_internal_mcp_forwarded_user(request)
+    req_id = None
+    try:
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id")
+        if body.get("method") != "notifications/cancelled":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        raw_request_id = params.get("requestId")
+        request_id = str(raw_request_id) if raw_request_id is not None else None
+        reason = params.get("reason")
+        logger.info("Request cancelled: %s, reason: %s", request_id, reason)
+        if request_id is not None:
+            await _authorize_run_cancellation(request, user, request_id, as_jsonrpc_error=False)
+            await cancellation_service.cancel_run(request_id, reason=reason)
+        await logging_service.notify(f"Request cancelled: {request_id}", LogLevel.INFO)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Internal MCP notifications/cancelled error: %s", exc)
+        return ORJSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "Internal error", "data": str(exc)},
+                "id": req_id,
+            }
+        )
+
+
+@utility_router.post("/_internal/mcp/tools/list/")
+@utility_router.post("/_internal/mcp/tools/list")
+async def handle_internal_mcp_tools_list(request: Request):
+    """Handle trusted server-scoped tools/list requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP tools/list request.
+
+    Returns:
+        MCP tools/list response payload for the requested virtual server.
+
+    Raises:
+        HTTPException: If the trusted server scope is missing or invalid.
+    """
+    server_id = request.headers.get("x-contextforge-server-id")
+    if not server_id:
+        raise HTTPException(status_code=400, detail="Missing trusted MCP server scope")
+
+    db = SessionLocal()
+    try:
+        user = await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="tools.read",
+            method="tools/list",
+            server_id=server_id,
+        )
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+        if is_admin and token_teams is None:
+            user_email = None
+            token_teams = None
+        elif token_teams is None:
+            token_teams = []
+
+        tools = await tool_service.list_server_mcp_tool_definitions(
+            db,
+            server_id,
+            user_email=user_email,
+            token_teams=token_teams,
+        )
+        return ORJSONResponse(content={"tools": tools})
+    except HTTPException:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content={"code": exc.code, "message": exc.message, "data": exc.data})
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/resources/list/")
+@utility_router.post("/_internal/mcp/resources/list")
+async def handle_internal_mcp_resources_list(request: Request):
+    """Handle trusted resources/list requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP resources/list request.
+
+    Returns:
+        MCP resources/list response payload.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "resources/list":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+        else:
+            server_id = params.get("server_id")
+        cursor = params.get("cursor")
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="resources.read",
+            method="resources/list",
+            server_id=server_id,
+        )
+
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+        if is_admin and token_teams is None:
+            user_email = None
+            token_teams = None
+        elif token_teams is None:
+            token_teams = []
+
+        if server_id:
+            resources = await resource_service.list_server_resources(
+                db,
+                server_id,
+                user_email=user_email,
+                token_teams=token_teams,
+            )
+            payload = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
+        else:
+            resources, next_cursor = await resource_service.list_resources(
+                db,
+                cursor=cursor,
+                limit=0,
+                user_email=user_email,
+                token_teams=token_teams,
+            )
+            payload = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
+            if next_cursor:
+                payload["nextCursor"] = next_cursor
+
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/resources/read/")
+@utility_router.post("/_internal/mcp/resources/read")
+async def handle_internal_mcp_resources_read(request: Request):
+    """Handle trusted resources/read requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP resources/read request.
+
+    Returns:
+        MCP resources/read response payload.
+    """
+    db = SessionLocal()
+    req_id = None
+    uri = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "resources/read":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+        else:
+            server_id = params.get("server_id")
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="resources.read",
+            method="resources/read",
+            server_id=server_id,
+        )
+
+        uri = params.get("uri")
+        request_id = params.get("requestId")
+        meta_data = params.get("_meta")
+        if not uri:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "code": -32602,
+                    "message": "Missing resource URI in parameters",
+                    "data": params,
+                },
+            )
+
+        auth_user_email, auth_token_teams, auth_is_admin = _get_rpc_filter_context(request, user)
+        if auth_is_admin and auth_token_teams is None:
+            auth_user_email = None
+        elif auth_token_teams is None:
+            auth_token_teams = []
+
+        plugin_context_table = getattr(request.state, "plugin_context_table", None)
+        plugin_global_context = getattr(request.state, "plugin_global_context", None)
+        result = await resource_service.read_resource(
+            db,
+            resource_uri=uri,
+            request_id=request_id,
+            user=auth_user_email,
+            server_id=server_id,
+            token_teams=auth_token_teams,
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+            meta_data=meta_data,
+        )
+        # First-Party
+        from mcpgateway.common.models import ResourceContent  # pylint: disable=import-outside-toplevel
+
+        if isinstance(result, ResourceContent):
+            normalized_content = {"uri": result.uri}
+            if result.mime_type:
+                normalized_content["mimeType"] = result.mime_type
+            if result.text is not None:
+                normalized_content["text"] = result.text
+            elif result.blob is not None:
+                normalized_content["blob"] = base64.b64encode(result.blob).decode("ascii")
+            payload = {"contents": [normalized_content]}
+        elif hasattr(result, "model_dump"):
+            payload = {"contents": [result.model_dump(by_alias=True, exclude_none=True)]}
+        else:
+            payload = {"contents": [result]}
+
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except ResourceNotFoundError as exc:
+        return ORJSONResponse(
+            status_code=404,
+            content={
+                "code": -32002,
+                "message": str(exc),
+                "data": {"uri": uri} if uri else None,
+            },
+        )
+    except ResourceError as exc:
+        return ORJSONResponse(
+            status_code=400,
+            content={
+                "code": -32602,
+                "message": str(exc),
+                "data": {"uri": uri} if uri else None,
+            },
+        )
+    except JSONRPCError as exc:
+        status_code = 403 if exc.code == -32003 else 400
+        return ORJSONResponse(status_code=status_code, content=exc.to_dict()["error"])
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/resources/subscribe/")
+@utility_router.post("/_internal/mcp/resources/subscribe")
+async def handle_internal_mcp_resources_subscribe(request: Request):
+    """Handle trusted resources/subscribe requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP resources/subscribe request.
+
+    Returns:
+        Empty JSON response confirming the subscription.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "resources/subscribe":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="resources.read",
+            method="resources/subscribe",
+            server_id=server_id,
+        )
+
+        uri = params.get("uri")
+        if not uri:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "code": -32602,
+                    "message": "Missing resource URI in parameters",
+                    "data": params,
+                },
+            )
+
+        access_user_email, access_token_teams = _get_scoped_resource_access_context(request, user)
+        user_email = get_user_email(user)
+        subscription = ResourceSubscription(uri=uri, subscriber_id=user_email)
+        await resource_service.subscribe_resource(
+            db,
+            subscription,
+            user_email=access_user_email,
+            token_teams=access_token_teams,
+        )
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content={})
+    except ResourceNotFoundError as exc:
+        return ORJSONResponse(
+            status_code=404,
+            content={"code": -32002, "message": str(exc), "data": None},
+        )
+    except PermissionError:
+        return ORJSONResponse(
+            status_code=403,
+            content={"code": -32003, "message": _ACCESS_DENIED_MSG, "data": {"method": "resources/subscribe"}},
+        )
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/resources/unsubscribe/")
+@utility_router.post("/_internal/mcp/resources/unsubscribe")
+async def handle_internal_mcp_resources_unsubscribe(request: Request):
+    """Handle trusted resources/unsubscribe requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP resources/unsubscribe request.
+
+    Returns:
+        Empty JSON response confirming the unsubscription.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "resources/unsubscribe":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="resources.read",
+            method="resources/unsubscribe",
+            server_id=server_id,
+        )
+
+        uri = params.get("uri")
+        if not uri:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "code": -32602,
+                    "message": "Missing resource URI in parameters",
+                    "data": params,
+                },
+            )
+
+        user_email = get_user_email(user)
+        subscription = ResourceSubscription(uri=uri, subscriber_id=user_email)
+        await resource_service.unsubscribe_resource(db, subscription)
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content={})
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/resources/templates/list/")
+@utility_router.post("/_internal/mcp/resources/templates/list")
+async def handle_internal_mcp_resource_templates_list(request: Request):
+    """Handle trusted resources/templates/list requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP resources/templates/list request.
+
+    Returns:
+        MCP resources/templates/list response payload.
+
+    Raises:
+        Exception: Propagated after best-effort rollback when unexpected failures occur.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "resources/templates/list":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+        else:
+            server_id = params.get("server_id")
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="resources.read",
+            method="resources/templates/list",
+            server_id=server_id,
+        )
+
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+        if is_admin and token_teams is None:
+            token_teams = None
+        elif token_teams is None:
+            token_teams = []
+
+        resource_templates = await resource_service.list_resource_templates(
+            db,
+            user_email=user_email,
+            token_teams=token_teams,
+            server_id=server_id,
+        )
+        payload = {"resourceTemplates": [rt.model_dump(by_alias=True, exclude_none=True) for rt in resource_templates]}
+
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/roots/list/")
+@utility_router.post("/_internal/mcp/roots/list")
+async def handle_internal_mcp_roots_list(request: Request):
+    """Handle trusted roots/list requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP roots/list request.
+
+    Returns:
+        MCP roots/list response payload.
+
+    Raises:
+        Exception: Propagated after best-effort rollback when unexpected failures occur.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "roots/list":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="admin.system_config",
+            method="roots/list",
+            server_id=None,
+        )
+        roots = await root_service.list_roots()
+        payload = {"roots": [r.model_dump(by_alias=True, exclude_none=True) for r in roots]}
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/completion/complete/")
+@utility_router.post("/_internal/mcp/completion/complete")
+async def handle_internal_mcp_completion_complete(request: Request):
+    """Handle trusted completion/complete requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP completion/complete request.
+
+    Returns:
+        MCP completion response payload.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "completion/complete":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+        else:
+            server_id = params.get("server_id")
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="tools.read",
+            method="completion/complete",
+            server_id=server_id,
+        )
+
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+        if is_admin and token_teams is None:
+            user_email = None
+            token_teams = None
+        elif token_teams is None:
+            token_teams = []
+
+        payload = await completion_service.handle_completion(
+            db,
+            params,
+            user_email=user_email,
+            token_teams=token_teams,
+        )
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/sampling/createMessage/")
+@utility_router.post("/_internal/mcp/sampling/createMessage")
+async def handle_internal_mcp_sampling_create_message(request: Request):
+    """Handle trusted sampling/createMessage requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP sampling/createMessage request.
+
+    Returns:
+        MCP sampling/createMessage response payload.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "sampling/createMessage":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        if request.headers.get("x-contextforge-mcp-runtime") == "rust":
+            server_id = request.headers.get("x-contextforge-server-id")
+            if server_id:
+                _enforce_internal_mcp_server_scope(request, server_id)
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        payload = await sampling_handler.create_message(db, params)
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/logging/setLevel/")
+@utility_router.post("/_internal/mcp/logging/setLevel")
+async def handle_internal_mcp_logging_set_level(request: Request):
+    """Handle trusted logging/setLevel requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP logging/setLevel request.
+
+    Returns:
+        Empty JSON response confirming the new log level.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "logging/setLevel":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="admin.system_config",
+            method="logging/setLevel",
+            server_id=None,
+        )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        level = LogLevel(params.get("level"))
+        await logging_service.set_level(level)
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content={})
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(status_code=500, content={"code": -32000, "message": "Internal error", "data": str(exc)})
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/prompts/list/")
+@utility_router.post("/_internal/mcp/prompts/list")
+async def handle_internal_mcp_prompts_list(request: Request):
+    """Handle trusted prompts/list requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP prompts/list request.
+
+    Returns:
+        MCP prompts/list response payload.
+
+    Raises:
+        Exception: Propagated after best-effort rollback when unexpected failures occur.
+    """
+    db = SessionLocal()
+    req_id = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "prompts/list":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+        else:
+            server_id = params.get("server_id")
+        cursor = params.get("cursor")
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="prompts.read",
+            method="prompts/list",
+            server_id=server_id,
+        )
+
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+        if is_admin and token_teams is None:
+            user_email = None
+            token_teams = None
+        elif token_teams is None:
+            token_teams = []
+
+        if server_id:
+            prompts = await prompt_service.list_server_prompts(
+                db,
+                server_id,
+                cursor=cursor,
+                user_email=user_email,
+                token_teams=token_teams,
+            )
+            payload = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
+        else:
+            prompts, next_cursor = await prompt_service.list_prompts(
+                db,
+                cursor=cursor,
+                limit=0,
+                user_email=user_email,
+                token_teams=token_teams,
+            )
+            payload = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
+            if next_cursor:
+                payload["nextCursor"] = next_cursor
+
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content=exc.to_dict()["error"])
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/prompts/get/")
+@utility_router.post("/_internal/mcp/prompts/get")
+async def handle_internal_mcp_prompts_get(request: Request):
+    """Handle trusted prompts/get requests forwarded from the Rust runtime.
+
+    Args:
+        request: Trusted internal MCP prompts/get request.
+
+    Returns:
+        MCP prompts/get response payload.
+
+    Raises:
+        Exception: Propagated after best-effort rollback when unexpected failures occur.
+    """
+    db = SessionLocal()
+    req_id = None
+    name = None
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        req_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or body.get("method") != "prompts/get":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": req_id,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") if request.headers.get("x-contextforge-mcp-runtime") == "rust" else None
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+        else:
+            server_id = params.get("server_id")
+
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission="prompts.read",
+            method="prompts/get",
+            server_id=server_id,
+        )
+
+        name = params.get("name")
+        arguments = params.get("arguments", {})
+        meta_data = params.get("_meta")
+        if not name:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "code": -32602,
+                    "message": "Missing prompt name in parameters",
+                    "data": params,
+                },
+            )
+
+        auth_user_email, auth_token_teams, auth_is_admin = _get_rpc_filter_context(request, user)
+        if auth_is_admin and auth_token_teams is None:
+            auth_user_email = None
+        elif auth_token_teams is None:
+            auth_token_teams = []
+
+        plugin_context_table = getattr(request.state, "plugin_context_table", None)
+        plugin_global_context = getattr(request.state, "plugin_global_context", None)
+        result = await prompt_service.get_prompt(
+            db,
+            name,
+            arguments,
+            user=auth_user_email,
+            server_id=server_id,
+            token_teams=auth_token_teams,
+            plugin_context_table=plugin_context_table,
+            plugin_global_context=plugin_global_context,
+            _meta_data=meta_data,
+        )
+        payload = result.model_dump(by_alias=True, exclude_none=True) if hasattr(result, "model_dump") else result
+
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=payload)
+    except PromptNotFoundError as exc:
+        return ORJSONResponse(
+            status_code=404,
+            content={
+                "code": -32002,
+                "message": str(exc),
+                "data": {"name": name} if name else None,
+            },
+        )
+    except PromptError as exc:
+        try:
+            if db.is_active and db.in_transaction() is not None:
+                db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return ORJSONResponse(
+            status_code=422,
+            content={
+                "code": -32000,
+                "message": str(exc),
+                "data": {"name": name} if name else None,
+            },
+        )
+    except JSONRPCError as exc:
+        status_code = 403 if exc.code == -32003 else 400
+        return ORJSONResponse(status_code=status_code, content=exc.to_dict()["error"])
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/mcp/tools/list/authz/")
+@utility_router.post("/_internal/mcp/tools/list/authz")
+async def handle_internal_mcp_tools_list_authz(request: Request):
+    """Authorize trusted server-scoped tools/list requests for the Rust direct-DB path.
+
+    Args:
+        request: Trusted internal MCP authz request.
+
+    Returns:
+        Empty success response when the request is authorized.
+    """
+    return await _authorize_internal_mcp_server_scoped_method(
+        request,
+        permission="tools.read",
+        method="tools/list",
+    )
+
+
+async def _authorize_internal_mcp_server_scoped_method(
+    request: Request,
+    *,
+    permission: str,
+    method: str,
+) -> Response:
+    """Authorize a trusted server-scoped MCP method for Rust direct-path execution.
+
+    Args:
+        request: Trusted internal MCP authz request.
+        permission: Permission required for the target method.
+        method: MCP method name being authorized.
+
+    Returns:
+        Empty success response when the method is authorized and remains eligible
+        for Rust direct execution, or a JSON success payload instructing Rust to
+        forward the request to Python when plugin hooks require Python
+        execution. Returns a JSON error response when authorization fails.
+
+    Raises:
+        HTTPException: If the trusted server scope header is missing.
+        Exception: Propagated after best-effort rollback when unexpected failures occur.
+    """
+    server_id = request.headers.get("x-contextforge-server-id")
+    if not server_id:
+        raise HTTPException(status_code=400, detail="Missing trusted MCP server scope")
+
+    db = SessionLocal()
+    try:
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission=permission,
+            method=method,
+            server_id=server_id,
+        )
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        plugin_manager = await get_plugin_manager()
+        fallback_reason = _server_scoped_direct_execution_fallback_reason(method, plugin_manager)
+        if fallback_reason:
+            return ORJSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "directExecutionEligible": False,
+                    "fallbackReason": fallback_reason,
+                },
+            )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content={"code": exc.code, "message": exc.message, "data": exc.data})
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        db.close()
+
+
+def _server_scoped_direct_execution_fallback_reason(method: str, plugin_manager) -> Optional[str]:
+    """Return a direct-execution fallback reason for server-scoped Rust MCP calls.
+
+    This fail-closed helper lets Python remain the source of truth for plugin
+    semantics. Rust can safely execute DB-direct reads only when no relevant
+    prompt/resource hooks are configured.
+
+    Args:
+        method: MCP method name being considered for Rust direct execution.
+        plugin_manager: Plugin manager instance to check for configured hooks.
+
+    Returns:
+        A stable fallback reason when Python must handle the request to preserve
+        plugin semantics, otherwise ``None``.
+    """
+    if not plugin_manager:
+        return None
+
+    if method == "resources/read":
+        if plugin_manager.has_hooks_for(ResourceHookType.RESOURCE_PRE_FETCH) or plugin_manager.has_hooks_for(ResourceHookType.RESOURCE_POST_FETCH):
+            return "resource-hooks-configured"
+    if method == "prompts/get":
+        if plugin_manager.has_hooks_for(PromptHookType.PROMPT_PRE_FETCH) or plugin_manager.has_hooks_for(PromptHookType.PROMPT_POST_FETCH):
+            return "prompt-hooks-configured"
+    return None
+
+
+@utility_router.post("/_internal/mcp/resources/list/authz/")
+@utility_router.post("/_internal/mcp/resources/list/authz")
+async def handle_internal_mcp_resources_list_authz(request: Request):
+    """Authorize trusted server-scoped resources/list requests for Rust direct-path execution.
+
+    Args:
+        request: Trusted internal MCP authz request.
+
+    Returns:
+        Empty success response when the request is authorized.
+    """
+    return await _authorize_internal_mcp_server_scoped_method(
+        request,
+        permission="resources.read",
+        method="resources/list",
+    )
+
+
+@utility_router.post("/_internal/mcp/resources/read/authz/")
+@utility_router.post("/_internal/mcp/resources/read/authz")
+async def handle_internal_mcp_resources_read_authz(request: Request):
+    """Authorize trusted server-scoped resources/read requests for Rust direct-path execution.
+
+    Args:
+        request: Trusted internal MCP authz request.
+
+    Returns:
+        Empty success response when the request is authorized.
+    """
+    return await _authorize_internal_mcp_server_scoped_method(
+        request,
+        permission="resources.read",
+        method="resources/read",
+    )
+
+
+@utility_router.post("/_internal/mcp/resources/templates/list/authz/")
+@utility_router.post("/_internal/mcp/resources/templates/list/authz")
+async def handle_internal_mcp_resource_templates_list_authz(request: Request):
+    """Authorize trusted server-scoped resources/templates/list requests for Rust direct-path execution.
+
+    Args:
+        request: Trusted internal MCP authz request.
+
+    Returns:
+        Empty success response when the request is authorized.
+    """
+    return await _authorize_internal_mcp_server_scoped_method(
+        request,
+        permission="resources.read",
+        method="resources/templates/list",
+    )
+
+
+@utility_router.post("/_internal/mcp/prompts/list/authz/")
+@utility_router.post("/_internal/mcp/prompts/list/authz")
+async def handle_internal_mcp_prompts_list_authz(request: Request):
+    """Authorize trusted server-scoped prompts/list requests for Rust direct-path execution.
+
+    Args:
+        request: Trusted internal MCP authz request.
+
+    Returns:
+        Empty success response when the request is authorized.
+    """
+    return await _authorize_internal_mcp_server_scoped_method(
+        request,
+        permission="prompts.read",
+        method="prompts/list",
+    )
+
+
+@utility_router.post("/_internal/mcp/prompts/get/authz/")
+@utility_router.post("/_internal/mcp/prompts/get/authz")
+async def handle_internal_mcp_prompts_get_authz(request: Request):
+    """Authorize trusted server-scoped prompts/get requests for Rust direct-path execution.
+
+    Args:
+        request: Trusted internal MCP authz request.
+
+    Returns:
+        Empty success response when the request is authorized.
+    """
+    return await _authorize_internal_mcp_server_scoped_method(
+        request,
+        permission="prompts.read",
+        method="prompts/get",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal A2A authorization endpoints (Rust A2A runtime sidecar)
+# ---------------------------------------------------------------------------
+
+
+@utility_router.post("/_internal/a2a/authenticate/")
+@utility_router.post("/_internal/a2a/authenticate")
+async def handle_internal_a2a_authenticate(request: Request):
+    """Authenticate an inbound A2A request for Rust runtime execution.
+
+    Delegates to the shared MCP authenticate handler — the auth flow is
+    identical (validate credentials, return auth context).
+    """
+    return await handle_internal_mcp_authenticate(request)
+
+
+async def _authorize_internal_a2a_method(
+    request: Request,
+    *,
+    permission: str,
+    method: str,
+) -> Response:
+    """Authorize a trusted internal A2A method for Rust module execution.
+
+    Reuses the core authorization machinery from the MCP runtime path.
+    """
+    db = SessionLocal()
+    try:
+        await _authorize_internal_mcp_request(
+            request,
+            db,
+            permission=permission,
+            method=method,
+        )
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except JSONRPCError as exc:
+        return ORJSONResponse(status_code=403, content={"code": exc.code, "message": exc.message, "data": exc.data})
+    except Exception:
+        logger.exception("Internal A2A authz error for method=%s permission=%s", method, permission)
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+def _get_internal_a2a_scope_context(request: Request) -> tuple[Optional[str], Optional[List[str]]]:
+    """Return scoped visibility context for trusted internal A2A requests."""
+    user = _build_internal_mcp_forwarded_user(request)
+    user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+
+    if is_admin and token_teams is None:
+        return user_email, None
+    if token_teams is None:
+        return user_email, []
+    return user_email, token_teams
+
+
+@utility_router.post("/_internal/a2a/invoke/authz/")
+@utility_router.post("/_internal/a2a/invoke/authz")
+async def handle_internal_a2a_invoke_authz(request: Request):
+    """Authorize trusted A2A invoke requests for Rust module execution."""
+    return await _authorize_internal_a2a_method(request, permission="a2a.invoke", method="a2a/invoke")
+
+
+@utility_router.post("/_internal/a2a/list/authz/")
+@utility_router.post("/_internal/a2a/list/authz")
+async def handle_internal_a2a_list_authz(request: Request):
+    """Authorize trusted A2A list requests for Rust module execution."""
+    return await _authorize_internal_a2a_method(request, permission="a2a.read", method="a2a/list")
+
+
+@utility_router.post("/_internal/a2a/get/authz/")
+@utility_router.post("/_internal/a2a/get/authz")
+async def handle_internal_a2a_get_authz(request: Request):
+    """Authorize trusted A2A get requests for Rust module execution."""
+    return await _authorize_internal_a2a_method(request, permission="a2a.read", method="a2a/get")
+
+
+# DbA2AAgent.id is `uuid.uuid4().hex` — 32 lower-case hex chars, no dashes.
+# Used to detect when a resolve identifier is a primary-key reference vs a
+# plain name; kept here (not in uaid module) because it's specific to the
+# internal resolve endpoint's lookup dispatch.
+_UUID_HEX_RE = re.compile(r"[0-9a-f]{32}")
+
+
+@utility_router.post("/_internal/a2a/agents/{agent_name}/resolve/")
+@utility_router.post("/_internal/a2a/agents/{agent_name}/resolve")
+async def handle_internal_a2a_agent_resolve(request: Request, agent_name: str):
+    """Resolve an A2A agent record for Rust module execution.
+
+    Returns the agent's endpoint, auth configuration (encrypted), and
+    protocol version so the Rust sidecar can invoke it directly.
+    """
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        # Reject leading/trailing whitespace outright rather than silently
+        # falling through to the name branch — a malicious caller could
+        # otherwise wrap a UAID or UUID in spaces to bypass the kind
+        # dispatch (e.g., ` <32-hex>` probes the name column instead of
+        # id). Names in the DB never carry flanking whitespace either, so
+        # this can't false-positive on legitimate input.
+        if agent_name != agent_name.strip():
+            logger.warning("A2A agent resolve rejected: identifier has surrounding whitespace (%r)", agent_name)
+            return ORJSONResponse(status_code=400, content={"error": "agent identifier must not contain leading or trailing whitespace"})
+
+        # Dispatch lookup on identifier kind so a collision across the
+        # name / id / uaid columns can't silently cross-select the wrong
+        # agent. UAID prefix and 32-hex UUIDs are distinctive; everything
+        # else falls through to name.
+        agent = None
+        if uaid_utils.is_uaid(agent_name):
+            agent = db.query(DbA2AAgent).filter(DbA2AAgent.uaid == agent_name, DbA2AAgent.enabled.is_(True)).first()
+        elif _UUID_HEX_RE.fullmatch(agent_name):
+            agent = db.query(DbA2AAgent).filter(DbA2AAgent.id == agent_name, DbA2AAgent.enabled.is_(True)).first()
+        if agent is None:
+            agent = db.query(DbA2AAgent).filter(DbA2AAgent.name == agent_name, DbA2AAgent.enabled.is_(True)).first()
+        if not agent:
+            a2a_server_service = A2AServerService()
+            server_agent = a2a_server_service.resolve_server_agent(db, agent_name, user_email=user_email, token_teams=token_teams)
+            if server_agent:
+                return ORJSONResponse(status_code=200, content=server_agent)
+            return ORJSONResponse(status_code=404, content={"error": f"agent '{agent_name}' not found"})
+        if not service._check_agent_access(agent, user_email, token_teams):  # pylint: disable=protected-access
+            # Surface visibility-denial as 403 to the trusted sidecar
+            # caller (inside _is_trusted_internal_mcp_runtime_request
+            # above) so it can avoid falling through to UAID
+            # cross-gateway dispatch for agents that exist locally but
+            # the requester cannot see. The sidecar is expected to
+            # translate this back to 404 when responding to the end
+            # user so existence of private agents is not leaked.
+            logger.warning("A2A agent %r visibility-denied for user=%s teams=%s on resolve", agent_name, user_email, token_teams)
+            return ORJSONResponse(status_code=403, content={"error": f"access denied to agent '{agent_name}'"})
+
+        result = {
+            "agent_id": agent.id,
+            "name": agent.name,
+            "endpoint_url": agent.endpoint_url,
+            "agent_type": agent.agent_type,
+            "protocol_version": agent.protocol_version,
+            "auth_type": agent.auth_type,
+        }
+        # Return encrypted auth values — Rust decrypts them with the shared secret.
+        if agent.auth_value:
+            result["auth_value_encrypted"] = agent.auth_value
+        if agent.auth_query_params:
+            result["auth_query_params_encrypted"] = agent.auth_query_params
+
+        return ORJSONResponse(status_code=200, content=result)
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/agents/{agent_name}/card/")
+@utility_router.post("/_internal/a2a/agents/{agent_name}/card")
+async def handle_internal_a2a_agent_card(request: Request, agent_name: str):
+    """Return the A2A AgentCard for an agent.
+
+    Called by the Rust sidecar to serve GetExtendedAgentCard /
+    agent/getExtendedCard / agent/getAuthenticatedExtendedCard requests.
+    """
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+
+        # Check agent visibility before building the card to avoid loading
+        # sensitive relationship data for agents the caller cannot see.
+        agent = db.query(DbA2AAgent).filter(DbA2AAgent.name == agent_name, DbA2AAgent.enabled.is_(True)).first()
+        card = None
+        if agent is not None:
+            if service._check_agent_access(agent, user_email, token_teams):  # pylint: disable=protected-access
+                card = service.get_agent_card(db, agent_name)
+            else:
+                logger.warning("A2A agent %r visibility-denied for user=%s teams=%s on card", agent_name, user_email, token_teams)
+        if card is None:
+            a2a_server_service = A2AServerService()
+            card = a2a_server_service.get_server_agent_card(db, agent_name, user_email=user_email, token_teams=token_teams)
+        if card is None:
+            return ORJSONResponse(status_code=404, content={"error": f"agent '{agent_name}' not found"})
+        return ORJSONResponse(status_code=200, content=card)
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/tasks/get/")
+@utility_router.post("/_internal/a2a/tasks/get")
+async def handle_internal_a2a_tasks_get(request: Request):
+    """Retrieve an A2A task for Rust module execution."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        task_id = body.get("task_id")
+        agent_id = body.get("agent_id")
+        if not task_id or not isinstance(task_id, str):
+            return ORJSONResponse(status_code=400, content={"error": "task_id is required and must be a string"})
+        if agent_id is not None and not isinstance(agent_id, str):
+            return ORJSONResponse(status_code=400, content={"error": "agent_id must be a string"})
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        task = service.get_task(db, task_id, agent_id=agent_id, user_email=user_email, token_teams=token_teams)
+        if task is None:
+            return ORJSONResponse(status_code=404, content={"error": f"task '{task_id}' not found"})
+        return ORJSONResponse(status_code=200, content=task)
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/tasks/list/")
+@utility_router.post("/_internal/a2a/tasks/list")
+async def handle_internal_a2a_tasks_list(request: Request):
+    """List A2A tasks for Rust module execution."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        agent_id = body.get("agent_id")
+        state = body.get("state")
+        if agent_id is not None and not isinstance(agent_id, str):
+            return ORJSONResponse(status_code=400, content={"error": "agent_id must be a string"})
+        if state is not None and not isinstance(state, str):
+            return ORJSONResponse(status_code=400, content={"error": "state must be a string"})
+        limit = min(int(body.get("limit", 100)), 1000)
+        offset = max(int(body.get("offset", 0)), 0)
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        tasks = service.list_tasks(db, agent_id=agent_id, state=state, limit=limit, offset=offset, user_email=user_email, token_teams=token_teams)
+        return ORJSONResponse(status_code=200, content={"tasks": tasks})
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/tasks/cancel/")
+@utility_router.post("/_internal/a2a/tasks/cancel")
+async def handle_internal_a2a_tasks_cancel(request: Request):
+    """Cancel an A2A task for Rust module execution."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        task_id = body.get("task_id")
+        agent_id = body.get("agent_id")
+        if not task_id or not isinstance(task_id, str):
+            return ORJSONResponse(status_code=400, content={"error": "task_id is required and must be a string"})
+        if agent_id is not None and not isinstance(agent_id, str):
+            return ORJSONResponse(status_code=400, content={"error": "agent_id must be a string"})
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        task = service.cancel_task(db, task_id, agent_id=agent_id, user_email=user_email, token_teams=token_teams)
+        if task is None:
+            return ORJSONResponse(status_code=404, content={"error": f"task '{task_id}' not found"})
+        return ORJSONResponse(status_code=200, content=task)
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/push/create/")
+@utility_router.post("/_internal/a2a/push/create")
+async def handle_internal_a2a_push_create(request: Request):
+    """Create a push notification config for Rust A2A runtime."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        if not body.get("a2a_agent_id") or not body.get("task_id") or not body.get("webhook_url"):
+            return ORJSONResponse(status_code=400, content={"error": "a2a_agent_id, task_id, and webhook_url are required"})
+
+        # Validate webhook URL through the schema to enforce SSRF protection.
+        try:
+            validated = A2APushNotificationConfigCreate(**body)
+        except Exception as validation_err:
+            return ORJSONResponse(status_code=400, content={"error": f"invalid push config: {validation_err}"})
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        if not service._check_agent_access_by_id(db, body["a2a_agent_id"], user_email, token_teams):  # pylint: disable=protected-access
+            logger.warning("A2A agent_id=%s visibility-denied for user=%s teams=%s on push/create", body["a2a_agent_id"], user_email, token_teams)
+            return ORJSONResponse(status_code=404, content={"error": "agent not found"})
+        cfg = service.create_push_config(db, validated.model_dump())
+        return ORJSONResponse(status_code=200, content=cfg)
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/push/get/")
+@utility_router.post("/_internal/a2a/push/get")
+async def handle_internal_a2a_push_get(request: Request):
+    """Retrieve a push notification config for Rust A2A runtime."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        task_id = body.get("task_id")
+        agent_id = body.get("agent_id")
+        if not task_id:
+            return ORJSONResponse(status_code=400, content={"error": "task_id is required"})
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        cfg = service.get_push_config(db, task_id, agent_id=agent_id)
+        if cfg is None:
+            return ORJSONResponse(status_code=404, content={"error": f"push config for task '{task_id}' not found"})
+        if not service._check_agent_access_by_id(db, cfg["a2a_agent_id"], user_email, token_teams):  # pylint: disable=protected-access
+            logger.warning("A2A push-config task_id=%s (agent_id=%s) visibility-denied for user=%s teams=%s on push/get", task_id, cfg["a2a_agent_id"], user_email, token_teams)
+            return ORJSONResponse(status_code=404, content={"error": f"push config for task '{task_id}' not found"})
+        return ORJSONResponse(status_code=200, content=cfg)
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/push/list/")
+@utility_router.post("/_internal/a2a/push/list")
+async def handle_internal_a2a_push_list(request: Request):
+    """List push notification configs for Rust A2A runtime."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        agent_id = body.get("agent_id")
+        task_id = body.get("task_id")
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        # Use the dispatch-oriented listing so the Rust sidecar receives
+        # plaintext auth_token values decrypted from the encrypted DB column.
+        # Visibility is enforced in SQL via ``_visible_agent_ids`` — no
+        # Python-side post-filter needed.
+        configs = service.list_push_configs_for_dispatch(
+            db,
+            agent_id=agent_id,
+            task_id=task_id,
+            user_email=user_email,
+            token_teams=token_teams,
+        )
+        return ORJSONResponse(status_code=200, content={"configs": configs})
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/push/delete/")
+@utility_router.post("/_internal/a2a/push/delete")
+async def handle_internal_a2a_push_delete(request: Request):
+    """Delete a push notification config for Rust A2A runtime."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        config_id = body.get("config_id")
+        if not config_id:
+            return ORJSONResponse(status_code=400, content={"error": "config_id is required"})
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        cfg = db.query(A2APushNotificationConfig).filter(A2APushNotificationConfig.id == config_id).first()
+        if cfg and not service._check_agent_access_by_id(db, cfg.a2a_agent_id, user_email, token_teams):  # pylint: disable=protected-access
+            logger.warning("A2A push-config id=%s (agent_id=%s) visibility-denied for user=%s teams=%s on push/delete", config_id, cfg.a2a_agent_id, user_email, token_teams)
+            return ORJSONResponse(status_code=404, content={"error": f"push config '{config_id}' not found"})
+        deleted = service.delete_push_config(db, config_id)
+        if not deleted:
+            return ORJSONResponse(status_code=404, content={"error": f"push config '{config_id}' not found"})
+        return ORJSONResponse(status_code=200, content={"deleted": True})
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/events/flush/")
+@utility_router.post("/_internal/a2a/events/flush")
+async def handle_internal_a2a_events_flush(request: Request):
+    """Batch-insert streaming events to PG for durability."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        events = body.get("events", [])
+        if not events:
+            return ORJSONResponse(status_code=200, content={"count": 0})
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+
+        # Verify the caller has access to the agents that own the referenced tasks.
+        # Unknown task_ids (no matching row) previously slipped past this
+        # check — a caller could flush events for a task_id that does not
+        # exist yet, bypassing visibility entirely.  Reject the batch when
+        # any referenced task_id has no owning agent row.
+        task_ids = {e["task_id"] for e in events if "task_id" in e}
+        if task_ids:
+            tasks = db.query(DbA2ATask).filter(DbA2ATask.task_id.in_(task_ids)).all()
+            known_task_ids = {t.task_id for t in tasks}
+            unknown_task_ids = task_ids - known_task_ids
+            if unknown_task_ids:
+                logger.warning(
+                    "A2A events/flush denied: user=%s teams=%s references unknown task_id(s) %s",
+                    user_email,
+                    token_teams,
+                    sorted(unknown_task_ids),
+                )
+                return ORJSONResponse(
+                    status_code=400,
+                    content={"error": "events reference unknown task_ids", "unknown_task_ids": sorted(unknown_task_ids)},
+                )
+            agent_ids = {t.a2a_agent_id for t in tasks}
+            for agent_id in agent_ids:
+                if not service._check_agent_access_by_id(db, agent_id, user_email, token_teams):  # pylint: disable=protected-access
+                    logger.warning("A2A events/flush denied: user=%s teams=%s lacks access to agent_id=%s (referenced by a flushed event)", user_email, token_teams, agent_id)
+                    return ORJSONResponse(status_code=403, content={"error": "access denied for one or more referenced tasks"})
+
+        count = service.flush_events(db, events)
+        return ORJSONResponse(status_code=200, content={"count": count})
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+@utility_router.post("/_internal/a2a/events/replay/")
+@utility_router.post("/_internal/a2a/events/replay")
+async def handle_internal_a2a_events_replay(request: Request):
+    """Replay events from PG for stream reconnection."""
+    if not _is_trusted_internal_mcp_runtime_request(request):
+        return ORJSONResponse(status_code=403, content={"error": "untrusted request"})
+
+    db = SessionLocal()
+    try:
+        body = await request.json()
+        task_id = body.get("task_id")
+        after_sequence = int(body.get("after_sequence", 0))
+        limit = min(int(body.get("limit", 1000)), 10000)
+        if not task_id:
+            return ORJSONResponse(status_code=400, content={"error": "task_id required"})
+
+        user_email, token_teams = _get_internal_a2a_scope_context(request)
+        service = A2AAgentService()
+        task_row = db.query(DbA2ATask).filter(DbA2ATask.task_id == task_id).first()
+        if task_row is None:
+            return ORJSONResponse(status_code=404, content={"error": "task not found"})
+        if not service._check_agent_access_by_id(db, task_row.a2a_agent_id, user_email, token_teams):  # pylint: disable=protected-access
+            logger.warning("A2A task_id=%s (agent_id=%s) visibility-denied for user=%s teams=%s on events/replay", task_id, task_row.a2a_agent_id, user_email, token_teams)
+            return ORJSONResponse(status_code=404, content={"error": "task not found"})
+        events = service.replay_events(db, task_id, after_sequence, limit=limit)
+        return ORJSONResponse(status_code=200, content={"events": events})
+    except Exception:
+        logger.exception("Internal A2A endpoint error")
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110
+        raise
+    finally:
+        db.close()
+
+
+async def _maybe_forward_affinitized_rpc_request(
+    request: Request,
+    *,
+    method: str,
+    params: Dict[str, Any],
+    req_id: Any,
+    lowered_request_headers: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """Forward an MCP request to the owning worker when session affinity requires it.
+
+    Args:
+        request: Incoming RPC request.
+        method: MCP method name being executed.
+        params: Parsed JSON-RPC params payload.
+        req_id: JSON-RPC request identifier.
+        lowered_request_headers: Lower-cased request headers used for forwarding.
+
+    Returns:
+        Forwarded JSON-RPC response payload when affinity forwarding handled the
+        request, otherwise ``None`` so local execution can continue.
+    """
+    request_headers = request.headers
+    rpc_client_host = getattr(getattr(request, "client", None), "host", None)
+    rpc_from_loopback = rpc_client_host in ("127.0.0.1", "::1") if rpc_client_host else False
+    mcp_session_id = request_headers.get("mcp-session-id") or request_headers.get("x-mcp-session-id")
+    is_internally_forwarded = rpc_from_loopback and request_headers.get("x-forwarded-internally") == "true"
+
+    if settings.mcpgateway_session_affinity_enabled and mcp_session_id and method != "initialize" and not is_internally_forwarded:
+        # First-Party
+        from mcpgateway.services.session_affinity import SessionAffinity, WORKER_ID  # pylint: disable=import-outside-toplevel
+
+        if not SessionAffinity.is_valid_mcp_session_id(mcp_session_id):
+            logger.debug("Invalid MCP session id for affinity forwarding, executing locally")
+            return None
+
+        session_short = mcp_session_id[:8] if len(mcp_session_id) >= 8 else mcp_session_id
+        logger.debug("[AFFINITY] Worker %s | Session %s... | Method: %s | RPC request received, checking affinity", WORKER_ID, session_short, method)
+        try:
+            # First-Party
+            from mcpgateway.services.session_affinity import get_session_affinity  # pylint: disable=import-outside-toplevel
+
+            pool = get_session_affinity()
+            forwarded_response = await pool.forward_request_to_owner(
+                mcp_session_id,
+                {"method": method, "params": params, "headers": lowered_request_headers, "req_id": req_id},
+            )
+            if forwarded_response is not None:
+                logger.info("[AFFINITY] Worker %s | Session %s... | Method: %s | Forwarded response received", WORKER_ID, session_short, method)
+                if "error" in forwarded_response:
+                    return {"jsonrpc": "2.0", "error": forwarded_response["error"], "id": req_id}
+                return {"jsonrpc": "2.0", "result": forwarded_response.get("result", {}), "id": req_id}
+        except RuntimeError:
+            logger.debug("[AFFINITY] Worker %s | Session %s... | Method: %s | Pool not initialized, executing locally", WORKER_ID, session_short, method)
+        return None
+
+    if is_internally_forwarded and mcp_session_id:
+        # First-Party
+        from mcpgateway.services.session_affinity import WORKER_ID  # pylint: disable=import-outside-toplevel
+
+        session_short = mcp_session_id[:8] if len(mcp_session_id) >= 8 else mcp_session_id
+        logger.debug("[AFFINITY] Worker %s | Session %s... | Method: %s | Internally forwarded request, executing locally", WORKER_ID, session_short, method)
+
+    return None
+
+
+async def _execute_rpc_initialize(
+    request: Request,
+    user,
+    *,
+    params: Dict[str, Any],
+    server_id: Optional[str],
+    mcp_session_id: Optional[str],
+):
+    """Execute the MCP initialize handshake while preserving session ownership semantics.
+
+    Args:
+        request: Incoming RPC request.
+        user: Authenticated user payload.
+        params: Initialize params payload.
+        server_id: Optional virtual server identifier.
+        mcp_session_id: Session id from the transport headers, when present.
+
+    Returns:
+        Serialized initialize result payload.
+
+    Raises:
+        JSONRPCError: If session ownership cannot be claimed or validated.
+    """
+    init_session_id = params.get("session_id") or params.get("sessionId") or request.query_params.get("session_id")
+    requester_email, requester_is_admin = _get_request_identity(request, user)
+
+    if init_session_id:
+        effective_owner = await session_registry.claim_session_owner(init_session_id, requester_email)
+        if effective_owner is None:
+            raise JSONRPCError(-32003, _ACCESS_DENIED_MSG, {"method": "initialize"})
+
+        if effective_owner and not requester_is_admin and requester_email != effective_owner:
+            raise JSONRPCError(-32003, _ACCESS_DENIED_MSG, {"method": "initialize"})
+
+    result = await session_registry.handle_initialize_logic(params, session_id=init_session_id, server_id=server_id)
+    if hasattr(result, "model_dump"):
+        result = result.model_dump(by_alias=True, exclude_none=True)
+
+    if settings.mcpgateway_session_affinity_enabled and mcp_session_id and mcp_session_id != "not-provided":
+        try:
+            # First-Party
+            from mcpgateway.services.session_affinity import get_session_affinity, WORKER_ID  # pylint: disable=import-outside-toplevel
+
+            pool = get_session_affinity()
+            await pool.register_session_owner(mcp_session_id)
+            logger.debug("[AFFINITY_INIT] Worker %s | Session %s... | Registered ownership after initialize", WORKER_ID, mcp_session_id[:8])
+        except Exception as e:
+            logger.warning("[AFFINITY_INIT] Failed to register session ownership: %s", e)
+
+    return result
+
+
+async def _execute_rpc_tools_call(
+    request: Request,
+    db: Session,
+    user,
+    *,
+    req_id: Any,
+    params: Dict[str, Any],
+    lowered_request_headers: Dict[str, str],
+    server_id: Optional[str],
+    skip_pre_invoke: bool = False,
+):
+    """Execute the hot-path ``tools/call`` branch without the generic RPC method switch.
+
+    Args:
+        request: Incoming RPC request.
+        db: Active database session.
+        user: Authenticated user payload.
+        req_id: JSON-RPC request identifier.
+        params: Parsed tools/call params payload.
+        lowered_request_headers: Lower-cased request headers used for passthrough.
+        server_id: Optional virtual server identifier.
+        skip_pre_invoke: When True, skip TOOL_PRE_INVOKE hooks (used by trusted Rust fallback path).
+
+    Returns:
+        Serialized MCP tools/call result payload.
+
+    Raises:
+        JSONRPCError: If the tool name is missing, execution is cancelled, or the
+            downstream tool branch reports a JSON-RPC-visible failure.
+    """
+    name = params.get("name")
+    arguments = params.get("arguments", {})
+    meta_data = params.get("_meta", None)
+    if not name:
+        raise JSONRPCError(-32602, "Missing tool name in parameters", params)
+
+    auth_user_email, auth_token_teams, auth_is_admin = _get_rpc_filter_context(request, user)
+    run_owner_email = auth_user_email
+    run_owner_team_ids = [] if auth_token_teams is None else list(auth_token_teams)
+    if auth_is_admin and auth_token_teams is None:
+        auth_user_email = None
+    elif auth_token_teams is None:
+        auth_token_teams = []
+
+    oauth_user_email = get_user_email(user)
+    plugin_context_table = getattr(request.state, "plugin_context_table", None)
+    plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
+    run_id = str(req_id) if req_id is not None else None
+    tool_task: Optional[asyncio.Task] = None
+
+    async def cancel_tool_task(reason: Optional[str] = None):
+        """Cancel the active tool execution task when cancellation is requested.
+
+        Args:
+            reason: Optional human-readable cancellation reason.
+        """
+        if tool_task and not tool_task.done():
+            logger.info("Cancelling tool task for run_id=%s, reason=%s", run_id, reason)
+            tool_task.cancel()
+
+    if settings.mcpgateway_tool_cancellation_enabled and run_id:
+        await cancellation_service.register_run(
+            run_id,
+            name=f"tool:{name}",
+            cancel_callback=cancel_tool_task,
+            owner_email=run_owner_email,
+            owner_team_ids=run_owner_team_ids,
+        )
+
+    try:
+        if settings.mcpgateway_tool_cancellation_enabled and run_id:
+            run_status = await cancellation_service.get_status(run_id)
+            if run_status and run_status.get("cancelled"):
+                raise JSONRPCError(-32800, f"Tool execution cancelled: {name}", {"requestId": run_id})
+
+        async def execute_tool():
+            """Execute the tool invocation using the existing Python service layer.
+
+            Returns:
+                Result returned by the Python tool service.
+
+            Raises:
+                JSONRPCError: If the requested tool cannot be found.
+            """
+            try:
+                return await tool_service.invoke_tool(
+                    db=db,
+                    name=name,
+                    arguments=arguments,
+                    request_headers=lowered_request_headers,
+                    app_user_email=oauth_user_email,
+                    user_email=auth_user_email,
+                    token_teams=auth_token_teams,
+                    server_id=server_id,
+                    plugin_context_table=plugin_context_table,
+                    plugin_global_context=plugin_global_context,
+                    meta_data=meta_data,
+                    skip_pre_invoke=skip_pre_invoke,
+                )
+            except (ToolNotFoundError, ValueError):
+                logger.error("Tool not found: %s", name)
+                raise JSONRPCError(-32601, f"Tool not found: {name}", None)
+
+        tool_task = asyncio.create_task(execute_tool())
+
+        if settings.mcpgateway_tool_cancellation_enabled and run_id:
+            run_status = await cancellation_service.get_status(run_id)
+            if run_status and run_status.get("cancelled"):
+                tool_task.cancel()
+
+        try:
+            result = await tool_task
+            if hasattr(result, "model_dump"):
+                result = result.model_dump(by_alias=True, exclude_none=True)
+            return result
+        except asyncio.CancelledError as exc:
+            logger.info("Tool execution cancelled for run_id=%s, tool=%s", run_id, name)
+            raise JSONRPCError(-32800, f"Tool execution cancelled: {name}", {"requestId": run_id, "partial": False}) from exc
+    finally:
+        if settings.mcpgateway_tool_cancellation_enabled and run_id:
+            await cancellation_service.unregister_run(run_id)
+
+
+@utility_router.post("/_internal/mcp/tools/call/")
+@utility_router.post("/_internal/mcp/tools/call")
+async def handle_internal_mcp_tools_call(request: Request):
+    """Handle trusted tools/call requests forwarded from the local Rust runtime.
+
+    Args:
+        request: Trusted internal MCP tools/call request.
+
+    Returns:
+        JSON-RPC response payload for the tools/call request.
+
+    Raises:
+        PluginError: Re-raised so plugin middleware can preserve existing behavior.
+        PluginViolationError: Re-raised so plugin middleware can preserve existing behavior.
+        Exception: Propagated after best-effort rollback when unexpected failures occur.
+    """
+    req_id = None
+    db = SessionLocal()
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        if not isinstance(body, dict) or body.get("method") != "tools/call":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": body.get("id") if isinstance(body, dict) else None,
+                },
+            )
+
+        req_id = body.get("id")
+        if req_id is None:
+            req_id = str(uuid.uuid4())
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        server_id = request.headers.get("x-contextforge-server-id") or params.get("server_id")
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+
+        lowered_request_headers = {k.lower(): v for k, v in request.headers.items()}
+        forwarded_response = await _maybe_forward_affinitized_rpc_request(
+            request,
+            method="tools/call",
+            params=params,
+            req_id=req_id,
+            lowered_request_headers=lowered_request_headers,
+        )
+        if forwarded_response is not None:
+            return forwarded_response
+
+        if (_get_internal_mcp_auth_context(request) or {}).get("is_authenticated", True) is True:
+            await _ensure_rpc_permission(user, db, "tools.execute", "tools/call", request=request)
+
+        # Trust the pre-invoke-ran marker only on this internal endpoint
+        # (authenticated via x-contextforge-mcp-runtime-auth shared secret).
+        # External clients cannot reach this path.
+        pre_invoke_ran = lowered_request_headers.get("x-contextforge-pre-invoke-ran") == "true"
+
+        try:
+            result = await _execute_rpc_tools_call(
+                request,
+                db,
+                user,
+                req_id=req_id,
+                params=params,
+                lowered_request_headers=lowered_request_headers,
+                server_id=server_id,
+                skip_pre_invoke=pre_invoke_ran,
+            )
+        finally:
+            if db.is_active and db.in_transaction() is not None:
+                db.commit()
+            db.close()
+
+        return {"jsonrpc": "2.0", "result": result, "id": req_id}
+    except (PluginError, PluginViolationError):
+        raise
+    except JSONRPCError as e:
+        error = e.to_dict()
+        return {"jsonrpc": "2.0", "error": error["error"], "id": req_id}
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass  # nosec B110 - Best effort cleanup on connection failure
+
+
+@utility_router.post("/_internal/mcp/tools/call/resolve/")
+@utility_router.post("/_internal/mcp/tools/call/resolve")
+async def handle_internal_mcp_tools_call_resolve(request: Request):
+    """Resolve a Rust-direct MCP tools/call execution plan without executing the tool.
+
+    Args:
+        request: Trusted internal MCP tools/call resolve request.
+
+    Returns:
+        JSON response containing either an execution plan or a JSON-RPC-visible error.
+
+    Raises:
+        PluginError: Re-raised so plugin middleware can preserve existing behavior.
+        PluginViolationError: Re-raised so plugin middleware can preserve existing behavior.
+        Exception: Propagated after best-effort rollback when unexpected failures occur.
+    """
+    db = SessionLocal()
+    try:
+        user = _build_internal_mcp_forwarded_user(request)
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+
+        if not isinstance(body, dict) or body.get("method") != "tools/call":
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request"},
+                    "id": body.get("id") if isinstance(body, dict) else None,
+                },
+            )
+
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        name = params.get("name")
+        if not name:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32602, "message": "Missing tool name in parameters"},
+                    "id": body.get("id"),
+                },
+            )
+
+        server_id = request.headers.get("x-contextforge-server-id") or params.get("server_id")
+        if server_id:
+            _enforce_internal_mcp_server_scope(request, server_id)
+
+        if (_get_internal_mcp_auth_context(request) or {}).get("is_authenticated", True) is True:
+            await _ensure_rpc_permission(user, db, "tools.execute", "tools/call", request=request)
+
+        auth_user_email, auth_token_teams, auth_is_admin = _get_rpc_filter_context(request, user)
+        if auth_is_admin and auth_token_teams is None:
+            auth_user_email = None
+        elif auth_token_teams is None:
+            auth_token_teams = []
+
+        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        plugin_context_table = getattr(request.state, "plugin_context_table", None)
+        plugin_global_context = getattr(request.state, "plugin_global_context", None)
+        plan = await tool_service.prepare_rust_mcp_tool_execution(
+            db=db,
+            name=name,
+            arguments=arguments,
+            request_headers={k.lower(): v for k, v in request.headers.items()},
+            app_user_email=get_user_email(user),
+            user_email=auth_user_email,
+            token_teams=auth_token_teams,
+            server_id=server_id,
+            plugin_global_context=plugin_global_context,
+            plugin_context_table=plugin_context_table,
+        )
+
+        if db.is_active and db.in_transaction() is not None:
+            db.commit()
+        return ORJSONResponse(content=plan)
+    except ToolNotFoundError as exc:
+        request_id = body.get("id") if isinstance(body, dict) else None
+        return ORJSONResponse(
+            status_code=404,
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": -32601, "message": str(exc)},
+                "id": request_id,
+            },
+        )
+    except ToolError as exc:
+        request_id = body.get("id") if isinstance(body, dict) else None
+        return ORJSONResponse(
+            status_code=400,
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": str(exc)},
+                "id": request_id,
+            },
+        )
+    except (PluginError, PluginViolationError):
+        raise
+    except JSONRPCError as exc:
+        request_id = body.get("id") if isinstance(body, dict) else None
+        return ORJSONResponse(
+            status_code=403,
+            content={
+                "jsonrpc": "2.0",
+                "error": {"code": exc.code, "message": exc.message, **({"data": exc.data} if exc.data is not None else {})},
+                "id": exc.request_id if exc.request_id is not None else request_id,
+            },
+        )
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        raise
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass  # nosec B110 - Best effort cleanup on connection failure
+
+
+@utility_router.post("/_internal/mcp/tools/call/metric/")
+@utility_router.post("/_internal/mcp/tools/call/metric")
+async def handle_internal_mcp_tools_call_metric(request: Request):
+    """Record buffered tool/server metrics for a Rust-direct `tools/call`.
+
+    Args:
+        request: Trusted internal metrics writeback request.
+
+    Returns:
+        ORJSONResponse acknowledging the buffered metric writeback.
+    """
+    _build_internal_mcp_forwarded_user(request)
+    try:
+        body = orjson.loads(await request.body())
+    except orjson.JSONDecodeError:
+        return ORJSONResponse(status_code=400, content={"detail": "Invalid JSON body"})
+
+    if not isinstance(body, dict):
+        return ORJSONResponse(status_code=400, content={"detail": "Invalid metrics payload"})
+
+    tool_id = body.get("toolId")
+    duration_ms = body.get("durationMs")
+    success = body.get("success")
+    server_id = body.get("serverId")
+    error_message = body.get("errorMessage")
+
+    if not isinstance(tool_id, str) or not tool_id.strip():
+        return ORJSONResponse(status_code=400, content={"detail": "Missing toolId"})
+    if not isinstance(duration_ms, (int, float)) or duration_ms < 0:
+        return ORJSONResponse(status_code=400, content={"detail": "Invalid durationMs"})
+    if not isinstance(success, bool):
+        return ORJSONResponse(status_code=400, content={"detail": "Invalid success flag"})
+    if server_id is not None and (not isinstance(server_id, str) or not server_id.strip()):
+        return ORJSONResponse(status_code=400, content={"detail": "Invalid serverId"})
+    if error_message is not None and not isinstance(error_message, str):
+        return ORJSONResponse(status_code=400, content={"detail": "Invalid errorMessage"})
+
+    request_server_id = request.headers.get("x-contextforge-server-id")
+    if request_server_id:
+        _enforce_internal_mcp_server_scope(request, request_server_id)
+        if server_id and server_id != request_server_id:
+            return ORJSONResponse(status_code=400, content={"detail": "serverId does not match forwarded server scope"})
+        server_id = request_server_id
+
+    # First-Party
+    from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service  # pylint: disable=import-outside-toplevel
+
+    metrics_buffer = get_metrics_buffer_service()
+    response_time = float(duration_ms) / 1000.0
+    metrics_buffer.record_tool_metric_with_duration(
+        tool_id=tool_id,
+        response_time=response_time,
+        success=success,
+        error_message=error_message,
+    )
+    if server_id:
+        metrics_buffer.record_server_metric_with_duration(
+            server_id=server_id,
+            response_time=response_time,
+            success=success,
+            error_message=error_message,
+        )
+
+    return ORJSONResponse(content={"status": "ok"})
+
+
+async def _handle_rpc_authenticated(request: Request, db: Session, user):
+    """Handle RPC requests.
+
+    Args:
+        request (Request): The incoming FastAPI request.
+        db (Session): Database session.
+        user: The authenticated user (dict with RBAC context).
+
+    Returns:
+        Response with the RPC result or error.
+
+    Raises:
+        PluginError: If encounters issue with plugin
+        PluginViolationError: If plugin violated the request. Example - In case of OPA plugin, if the request is denied by policy.
+    """
+    req_id = None
+    try:
+        # Extract user identifier from either RBAC user object or JWT payload
+        if hasattr(user, "email"):
+            user_id = getattr(user, "email", None)  # RBAC user object
+        elif isinstance(user, dict):
+            user_id = user.get("sub") or user.get("email") or user.get("username", "unknown")  # JWT payload
+        else:
+            user_id = str(user)  # String username from basic auth
+
+        logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user_id))} made an RPC request")
+        try:
+            body = orjson.loads(await request.body())
+        except orjson.JSONDecodeError:
+            return ORJSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "Parse error"},
+                    "id": None,
+                },
+            )
+        request_headers = request.headers
+        lowered_headers: Optional[Dict[str, str]] = None
+
+        def _lowered_request_headers() -> Dict[str, str]:
+            """Return a cached lower-cased copy of the incoming request headers.
+
+            Returns:
+                Dict[str, str]: Lower-cased request headers cached for repeated access.
+            """
+            nonlocal lowered_headers
+            if lowered_headers is None:
+                lowered_headers = {k.lower(): v for k, v in request_headers.items()}
+            return lowered_headers
+
+        _trusted_internal_mcp_dispatch = _get_internal_mcp_auth_context(request) is not None
+        _internal_runtime_server_id = request_headers.get("x-contextforge-server-id") if request_headers.get("x-contextforge-mcp-runtime") == "rust" else None
+
+        method = body["method"]
+        req_id = body.get("id")
+        if req_id is None:
+            req_id = str(uuid.uuid4())
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        if _internal_runtime_server_id:
+            params["server_id"] = _internal_runtime_server_id
+        server_id = params.get("server_id", None)
+        cursor = params.get("cursor")  # Extract cursor parameter
+        mcp_session_id = request_headers.get("mcp-session-id") or request_headers.get("x-mcp-session-id")
+
+        # RBAC: Enforce server_id scoping for server-scoped tokens.
+        # Extract token scopes once, then:
+        #   1. If request supplies server_id, validate it matches the token scope.
+        #   2. If request omits server_id but token is server-scoped, auto-inject the
+        #      token's server_id so list operations stay properly scoped (parity with
+        #      the REST middleware which denies /tools for server-scoped tokens).
+        _cached = getattr(request.state, "_jwt_verified_payload", None)
+        _jwt_payload = _cached[1] if (isinstance(_cached, tuple) and len(_cached) == 2 and isinstance(_cached[1], dict)) else None
+        _token_scopes = _jwt_payload.get("scopes", {}) if _jwt_payload else {}
+        _internal_auth_context = _get_internal_mcp_auth_context(request)
+        if (not _token_scopes) and isinstance(_internal_auth_context, dict):
+            _scoped_server_id = _internal_auth_context.get("scoped_server_id")
+            if isinstance(_scoped_server_id, str) and _scoped_server_id:
+                _token_scopes = {"server_id": _scoped_server_id}
+        _token_server_id = _token_scopes.get("server_id") if _token_scopes else None
+
+        if server_id:
+            if not validate_server_access(_token_scopes, server_id):
+                return ORJSONResponse(
+                    status_code=403,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32003, "message": f"Token not authorized for server: {server_id}"},
+                        "id": req_id,
+                    },
+                )
+        elif _token_server_id is not None:
+            server_id = _token_server_id
+
+        if not _trusted_internal_mcp_dispatch:
+            RPCRequest(jsonrpc="2.0", method=method, params=params)  # Validate the request body against the RPCRequest model
+
+        forwarded_response = await _maybe_forward_affinitized_rpc_request(
+            request,
+            method=method,
+            params=params,
+            req_id=req_id,
+            lowered_request_headers=_lowered_request_headers(),
+        )
+        if forwarded_response is not None:
+            return forwarded_response
+
+        if method == "initialize":
+            result = await _execute_rpc_initialize(
+                request,
+                user,
+                params=params,
+                server_id=server_id,
+                mcp_session_id=mcp_session_id,
+            )
+        elif method == "tools/list":
+            await _ensure_rpc_permission(user, db, "tools.read", method, request=request)
+            user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+            _req_email, _req_is_admin = user_email, is_admin
+            _req_team_roles = get_user_team_roles(db, _req_email) if _req_email and not _req_is_admin else None
+            # Admin bypass - only when token has NO team restrictions
+            if is_admin and token_teams is None:
+                user_email = None
+                token_teams = None  # Admin unrestricted
+            elif token_teams is None:
+                token_teams = []  # Non-admin without teams = public-only (secure default)
+            if server_id:
+                tools = await tool_service.list_server_tools(
+                    db,
+                    server_id,
+                    cursor=cursor,
+                    user_email=user_email,
+                    token_teams=token_teams,
+                    requesting_user_email=_req_email,
+                    requesting_user_is_admin=_req_is_admin,
+                    requesting_user_team_roles=_req_team_roles,
+                )
+                # Release DB connection early to prevent idle-in-transaction under load
+                db.commit()
+                db.close()
+                result = {"tools": _serialize_mcp_tool_definitions(tools)}
+            else:
+                tools, next_cursor = await tool_service.list_tools(
+                    db,
+                    cursor=cursor,
+                    limit=0,
+                    user_email=user_email,
+                    token_teams=token_teams,
+                    requesting_user_email=_req_email,
+                    requesting_user_is_admin=_req_is_admin,
+                    requesting_user_team_roles=_req_team_roles,
+                )
+                # Release DB connection early to prevent idle-in-transaction under load
+                db.commit()
+                db.close()
+                result = {"tools": _serialize_mcp_tool_definitions(tools)}
+                if next_cursor:
+                    result["nextCursor"] = next_cursor
+        elif method == "list_tools":  # Legacy endpoint
+            await _ensure_rpc_permission(user, db, "tools.read", method, request=request)
+            user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+            _req_email, _req_is_admin = user_email, is_admin
+            _req_team_roles = get_user_team_roles(db, _req_email) if _req_email and not _req_is_admin else None
+            # Admin bypass - only when token has NO team restrictions (token_teams is None)
+            # If token has explicit team scope (even empty [] for public-only), respect it
+            if is_admin and token_teams is None:
+                user_email = None
+                token_teams = None  # Admin unrestricted
+            elif token_teams is None:
+                token_teams = []  # Non-admin without teams = public-only (secure default)
+            if server_id:
+                tools = await tool_service.list_server_tools(
+                    db,
+                    server_id,
+                    cursor=cursor,
+                    user_email=user_email,
+                    token_teams=token_teams,
+                    requesting_user_email=_req_email,
+                    requesting_user_is_admin=_req_is_admin,
+                    requesting_user_team_roles=_req_team_roles,
+                )
+                db.commit()
+                db.close()
+                result = {"tools": _serialize_legacy_tool_payloads(tools)}
+            else:
+                tools, next_cursor = await tool_service.list_tools(
+                    db,
+                    cursor=cursor,
+                    limit=0,
+                    user_email=user_email,
+                    token_teams=token_teams,
+                    requesting_user_email=_req_email,
+                    requesting_user_is_admin=_req_is_admin,
+                    requesting_user_team_roles=_req_team_roles,
+                )
+                db.commit()
+                db.close()
+                result = {"tools": _serialize_legacy_tool_payloads(tools)}
+                if next_cursor:
+                    result["nextCursor"] = next_cursor
+        elif method == "list_gateways":
+            await _ensure_rpc_permission(user, db, "gateways.read", method, request=request)
+            user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+            # Admin bypass - only when token has NO team restrictions
+            if is_admin and token_teams is None:
+                user_email = None
+                token_teams = None  # Admin unrestricted
+            elif token_teams is None:
+                token_teams = []  # Non-admin without teams = public-only (secure default)
+            gateways, next_cursor = await gateway_service.list_gateways(db, include_inactive=False, user_email=user_email, token_teams=token_teams)
+            db.commit()
+            db.close()
+            result = {"gateways": [g.model_dump(by_alias=True, exclude_none=True) for g in gateways]}
+            if next_cursor:
+                result["nextCursor"] = next_cursor
+        elif method == "list_roots":
+            await _ensure_rpc_permission(user, db, "admin.system_config", method, request=request)
+            roots = await root_service.list_roots()
+            result = {"roots": [r.model_dump(by_alias=True, exclude_none=True) for r in roots]}
+        elif method == "resources/list":
+            await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
+            user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+            # Admin bypass - only when token has NO team restrictions
+            if is_admin and token_teams is None:
+                user_email = None
+                token_teams = None  # Admin unrestricted
+            elif token_teams is None:
+                token_teams = []  # Non-admin without teams = public-only (secure default)
+            if server_id:
+                resources = await resource_service.list_server_resources(db, server_id, user_email=user_email, token_teams=token_teams)
+                db.commit()
+                db.close()
+                result = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
+            else:
+                resources, next_cursor = await resource_service.list_resources(db, cursor=cursor, limit=0, user_email=user_email, token_teams=token_teams)
+                db.commit()
+                db.close()
+                result = {"resources": [r.model_dump(by_alias=True, exclude_none=True) for r in resources]}
+                if next_cursor:
+                    result["nextCursor"] = next_cursor
+        elif method == "resources/read":
+            await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
+            uri = params.get("uri")
+            request_id = params.get("requestId", None)
+            meta_data = params.get("_meta", None)
+            if not uri:
+                raise JSONRPCError(-32602, "Missing resource URI in parameters", params)
+
+            # Get authorization context (same as resources/list)
+            auth_user_email, auth_token_teams, auth_is_admin = _get_rpc_filter_context(request, user)
+            if auth_is_admin and auth_token_teams is None:
+                auth_user_email = None
+                # auth_token_teams stays None (unrestricted)
+            elif auth_token_teams is None:
+                auth_token_teams = []  # Non-admin without teams = public-only
+
+            # Get user email for OAuth token selection
+            oauth_user_email = get_user_email(user)
+            # Get plugin contexts from request.state for cross-hook sharing
+            plugin_context_table = getattr(request.state, "plugin_context_table", None)
+            plugin_global_context = getattr(request.state, "plugin_global_context", None)
+            try:
+                result = await resource_service.read_resource(
+                    db,
+                    resource_uri=uri,
+                    request_id=request_id,
+                    user=auth_user_email,
+                    server_id=server_id,
+                    token_teams=auth_token_teams,
+                    plugin_context_table=plugin_context_table,
+                    plugin_global_context=plugin_global_context,
+                    meta_data=meta_data,
+                )
+                if hasattr(result, "model_dump"):
+                    result = {"contents": [result.model_dump(by_alias=True, exclude_none=True)]}
+                else:
+                    result = {"contents": [result]}
+            except (ValueError, ResourceNotFoundError):
+                # Resource not found in the gateway
+                logger.error("Resource not found: %s", uri)
+                raise JSONRPCError(-32002, f"Resource not found: {uri}", {"uri": uri})
+            # Release transaction after resources/read completes
+            db.commit()
+            db.close()
+        elif method == "resources/subscribe":
+            await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
+            # MCP spec-compliant resource subscription endpoint
+            uri = params.get("uri")
+            if not uri:
+                raise JSONRPCError(-32602, "Missing resource URI in parameters", params)
+            access_user_email, access_token_teams = _get_scoped_resource_access_context(request, user)
+            # Get user email for subscriber ID
+            user_email = get_user_email(user)
+            subscription = ResourceSubscription(uri=uri, subscriber_id=user_email)
+            try:
+                await resource_service.subscribe_resource(db, subscription, user_email=access_user_email, token_teams=access_token_teams)
+            except PermissionError:
+                raise JSONRPCError(-32003, _ACCESS_DENIED_MSG, {"method": method})
+            db.commit()
+            db.close()
+            result = {}
+        elif method == "resources/unsubscribe":
+            await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
+            # MCP spec-compliant resource unsubscription endpoint
+            uri = params.get("uri")
+            if not uri:
+                raise JSONRPCError(-32602, "Missing resource URI in parameters", params)
+            # Get user email for subscriber ID
+            user_email = get_user_email(user)
+            subscription = ResourceSubscription(uri=uri, subscriber_id=user_email)
+            await resource_service.unsubscribe_resource(db, subscription)
+            db.commit()
+            db.close()
+            result = {}
+        elif method == "prompts/list":
+            await _ensure_rpc_permission(user, db, "prompts.read", method, request=request)
+            user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+            # Admin bypass - only when token has NO team restrictions
+            if is_admin and token_teams is None:
+                user_email = None
+                token_teams = None  # Admin unrestricted
+            elif token_teams is None:
+                token_teams = []  # Non-admin without teams = public-only (secure default)
+            if server_id:
+                prompts = await prompt_service.list_server_prompts(db, server_id, cursor=cursor, user_email=user_email, token_teams=token_teams)
+                db.commit()
+                db.close()
+                result = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
+            else:
+                prompts, next_cursor = await prompt_service.list_prompts(db, cursor=cursor, limit=0, user_email=user_email, token_teams=token_teams)
+                db.commit()
+                db.close()
+                result = {"prompts": [p.model_dump(by_alias=True, exclude_none=True) for p in prompts]}
+                if next_cursor:
+                    result["nextCursor"] = next_cursor
+        elif method == "prompts/get":
+            await _ensure_rpc_permission(user, db, "prompts.read", method, request=request)
+            name = params.get("name")
+            arguments = params.get("arguments", {})
+            meta_data = params.get("_meta", None)
+            if not name:
+                raise JSONRPCError(-32602, "Missing prompt name in parameters", params)
+
+            # Get authorization context (same as prompts/list)
+            auth_user_email, auth_token_teams, auth_is_admin = _get_rpc_filter_context(request, user)
+            if auth_is_admin and auth_token_teams is None:
+                auth_user_email = None
+                # auth_token_teams stays None (unrestricted)
+            elif auth_token_teams is None:
+                auth_token_teams = []  # Non-admin without teams = public-only
+
+            # Get plugin contexts from request.state for cross-hook sharing
+            plugin_context_table = getattr(request.state, "plugin_context_table", None)
+            plugin_global_context = getattr(request.state, "plugin_global_context", None)
+            result = await prompt_service.get_prompt(
+                db,
+                name,
+                arguments,
+                user=auth_user_email,
+                server_id=server_id,
+                token_teams=auth_token_teams,
+                plugin_context_table=plugin_context_table,
+                plugin_global_context=plugin_global_context,
+                _meta_data=meta_data,
+            )
+            if hasattr(result, "model_dump"):
+                result = result.model_dump(by_alias=True, exclude_none=True)
+            # Release transaction after prompts/get completes
+            db.commit()
+            db.close()
+        elif method == "ping":
+            # Per the MCP spec, a ping returns an empty result.
+            result = {}
+        elif method == "tools/call":  # pylint: disable=too-many-nested-blocks
+            await _ensure_rpc_permission(user, db, "tools.execute", method, request=request)
+            # Note: Multi-worker session affinity forwarding is handled earlier
+            # (before method routing) to apply to ALL methods, not just tools/call
+            try:
+                result = await _execute_rpc_tools_call(
+                    request,
+                    db,
+                    user,
+                    req_id=req_id,
+                    params=params,
+                    lowered_request_headers=_lowered_request_headers(),
+                    server_id=server_id,
+                )
+            finally:
+                # Release transaction after tools/call completes
+                db.commit()
+                db.close()
+        # TODO: Implement methods  # pylint: disable=fixme
+        elif method == "resources/templates/list":
+            await _ensure_rpc_permission(user, db, "resources.read", method, request=request)
+            # MCP spec-compliant resource templates list endpoint
+            # Use _get_rpc_filter_context - same pattern as tools/list
+            user_email_rpc, token_teams_rpc, is_admin_rpc = _get_rpc_filter_context(request, user)
+
+            # Admin bypass - only when token has NO team restrictions
+            if is_admin_rpc and token_teams_rpc is None:
+                token_teams_rpc = None  # Admin unrestricted
+            elif token_teams_rpc is None:
+                token_teams_rpc = []  # Non-admin without teams = public-only
+
+            resource_templates = await resource_service.list_resource_templates(
+                db,
+                user_email=user_email_rpc,
+                token_teams=token_teams_rpc,
+                server_id=server_id,
+            )
+            db.commit()
+            db.close()
+            result = {"resourceTemplates": [rt.model_dump(by_alias=True, exclude_none=True) for rt in resource_templates]}
+        elif method == "roots/list":
+            # MCP spec-compliant method name
+            await _ensure_rpc_permission(user, db, "admin.system_config", method, request=request)
+            roots = await root_service.list_roots()
+            result = {"roots": [r.model_dump(by_alias=True, exclude_none=True) for r in roots]}
+        elif method.startswith("roots/"):
+            # Catch-all for other roots/* methods (currently unsupported)
+            result = {}
+        elif method == "notifications/initialized":
+            # MCP spec-compliant notification: client initialized
+            logger.info("Client initialized")
+            await logging_service.notify("Client initialized", LogLevel.INFO)
+            result = {}
+        elif method == "notifications/cancelled":
+            # MCP spec-compliant notification: request cancelled
+            # Note: requestId can be 0 (valid per JSON-RPC), so use 'is not None' and normalize to string
+            raw_request_id = params.get("requestId")
+            request_id = str(raw_request_id) if raw_request_id is not None else None
+            reason = params.get("reason")
+            logger.info("Request cancelled: %s, reason: %s", request_id, reason)
+            # Attempt local cancellation per MCP spec
+            if request_id is not None:
+                await _authorize_run_cancellation(request, user, request_id, as_jsonrpc_error=True)
+                await cancellation_service.cancel_run(request_id, reason=reason)
+            await logging_service.notify(f"Request cancelled: {request_id}", LogLevel.INFO)
+            result = {}
+        elif method == "notifications/message":
+            # MCP spec-compliant notification: log message
+            await logging_service.notify(
+                params.get("data"),
+                LogLevel(params.get("level", "info")),
+                params.get("logger"),
+            )
+            result = {}
+        elif method.startswith("notifications/"):
+            # Catch-all for other notifications/* methods (currently unsupported)
+            result = {}
+        elif method == "sampling/createMessage":
+            # MCP spec-compliant sampling endpoint
+            result = await sampling_handler.create_message(db, params)
+        elif method.startswith("sampling/"):
+            # Catch-all for other sampling/* methods (currently unsupported)
+            result = {}
+        elif method == "elicitation/create":
+            # MCP spec 2025-06-18: Elicitation support (server-to-client requests)
+            # Elicitation allows servers to request structured user input through clients
+
+            # Check if elicitation is enabled
+            if not settings.mcpgateway_elicitation_enabled:
+                raise JSONRPCError(-32601, "Elicitation feature is disabled", {"feature": "elicitation", "config": "MCPGATEWAY_ELICITATION_ENABLED=false"})
+
+            # Validate params
+            # First-Party
+            from mcpgateway.common.models import ElicitRequestParams  # pylint: disable=import-outside-toplevel
+            from mcpgateway.services.elicitation_service import get_elicitation_service  # pylint: disable=import-outside-toplevel
+
+            try:
+                elicit_params = ElicitRequestParams(**params)
+            except Exception as e:
+                raise JSONRPCError(-32602, f"Invalid elicitation params: {e}", params)
+
+            # Get target session (from params or find elicitation-capable session)
+            target_session_id = params.get("session_id") or params.get("sessionId")
+            if not target_session_id:
+                # Find an elicitation-capable session
+                capable_sessions = await session_registry.get_elicitation_capable_sessions()
+                if not capable_sessions:
+                    raise JSONRPCError(-32000, "No elicitation-capable clients available", {"message": elicit_params.message})
+                target_session_id = capable_sessions[0]
+                logger.debug("Selected session %s for elicitation", target_session_id)
+
+            # Verify session has elicitation capability
+            if not await session_registry.has_elicitation_capability(target_session_id):
+                raise JSONRPCError(-32000, f"Session {target_session_id} does not support elicitation", {"session_id": target_session_id})
+
+            # Get elicitation service and create request
+            elicitation_service = get_elicitation_service()
+
+            # Extract timeout from params or use default
+            timeout = params.get("timeout", settings.mcpgateway_elicitation_timeout)
+
+            try:
+                # Create elicitation request - this stores it and waits for response
+                # For now, use dummy upstream_session_id - in full bidirectional proxy,
+                # this would be the session that initiated the request
+                upstream_session_id = "gateway"
+
+                # Start the elicitation (creates pending request and future)
+                elicitation_task = asyncio.create_task(
+                    elicitation_service.create_elicitation(
+                        upstream_session_id=upstream_session_id, downstream_session_id=target_session_id, message=elicit_params.message, requested_schema=elicit_params.requestedSchema, timeout=timeout
+                    )
+                )
+
+                # Get the pending elicitation to extract request_id
+                # Wait a moment for it to be created
+                await asyncio.sleep(0.01)
+                pending_elicitations = [e for e in elicitation_service._pending.values() if e.downstream_session_id == target_session_id]  # pylint: disable=protected-access
+                if not pending_elicitations:
+                    raise JSONRPCError(-32000, "Failed to create elicitation request", {})
+
+                pending = pending_elicitations[-1]  # Get most recent
+
+                # Send elicitation request to client via broadcast
+                elicitation_request = {
+                    "jsonrpc": "2.0",
+                    "id": pending.request_id,
+                    "method": "elicitation/create",
+                    "params": {"message": elicit_params.message, "requestedSchema": elicit_params.requestedSchema},
+                }
+
+                await session_registry.broadcast(target_session_id, elicitation_request)
+                logger.debug("Sent elicitation request %s to session %s", pending.request_id, target_session_id)
+
+                # Wait for response
+                elicit_result = await elicitation_task
+
+                # Return result
+                result = elicit_result.model_dump(by_alias=True, exclude_none=True)
+
+            except asyncio.TimeoutError:
+                raise JSONRPCError(-32000, f"Elicitation timed out after {timeout}s", {"message": elicit_params.message, "timeout": timeout})
+            except ValueError as e:
+                raise JSONRPCError(-32000, str(e), {"message": elicit_params.message})
+        elif method.startswith("elicitation/"):
+            # Catch-all for other elicitation/* methods
+            result = {}
+        elif method == "completion/complete":
+            await _ensure_rpc_permission(user, db, "tools.read", method, request=request)
+            # MCP spec-compliant completion endpoint
+            user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+            if is_admin and token_teams is None:
+                user_email = None
+            elif token_teams is None:
+                token_teams = []
+            result = await completion_service.handle_completion(db, params, user_email=user_email, token_teams=token_teams)
+        elif method.startswith("completion/"):
+            # Catch-all for other completion/* methods (currently unsupported)
+            result = {}
+        elif method == "logging/setLevel":
+            await _ensure_rpc_permission(user, db, "admin.system_config", method, request=request)
+            level = LogLevel(params.get("level"))
+            await logging_service.set_level(level)
+            result = {}
+        elif method.startswith("logging/"):
+            # Catch-all for other logging/* methods (currently unsupported)
+            result = {}
+        else:
+            # Backward compatibility: Try to invoke as a tool directly
+            # This allows both old format (method=tool_name) and new format (method=tools/call)
+            await _ensure_rpc_permission(user, db, "tools.execute", method, request=request)
+
+            # Get authorization context (same as tools/call)
+            auth_user_email, auth_token_teams, auth_is_admin = _get_rpc_filter_context(request, user)
+            if auth_is_admin and auth_token_teams is None:
+                auth_user_email = None
+                # auth_token_teams stays None (unrestricted)
+            elif auth_token_teams is None:
+                auth_token_teams = []  # Non-admin without teams = public-only
+
+            # Get user email for OAuth token selection
+            oauth_user_email = get_user_email(user)
+            # Get server_id from params if provided
+            server_id = params.get("server_id")
+            # Get plugin contexts from request.state for cross-hook sharing
+            plugin_context_table = getattr(request.state, "plugin_context_table", None)
+            plugin_global_context = getattr(request.state, "plugin_global_context", None)
+
+            meta_data = params.get("_meta", None)
+
+            try:
+                result = await tool_service.invoke_tool(
+                    db=db,
+                    name=method,
+                    arguments=params,
+                    request_headers=_lowered_request_headers(),
+                    app_user_email=oauth_user_email,
+                    user_email=auth_user_email,
+                    token_teams=auth_token_teams,
+                    server_id=server_id,
+                    plugin_context_table=plugin_context_table,
+                    plugin_global_context=plugin_global_context,
+                    meta_data=meta_data,
+                )
+                if hasattr(result, "model_dump"):
+                    result = result.model_dump(by_alias=True, exclude_none=True)
+            except (PluginError, PluginViolationError):
+                raise
+            except Exception:
+                # Log error and return invalid method
+                logger.error("Method not found: %s", method)
+                raise JSONRPCError(-32000, "Invalid method", params)
+
+        return {"jsonrpc": "2.0", "result": result, "id": req_id}
+
+    except (PluginError, PluginViolationError):
+        raise
+    except JSONRPCError as e:
+        error = e.to_dict()
+        return {"jsonrpc": "2.0", "error": error["error"], "id": req_id}
+    except Exception as e:
+        if isinstance(e, ValueError):
+            return ORJSONResponse(content={"message": "Method invalid"}, status_code=422)
+        logger.error(f"RPC error: {str(e)}")
+        return {
+            "jsonrpc": "2.0",
+            "error": {"code": -32000, "message": "Internal error", "data": str(e)},
+            "id": req_id,
+        }
+
+
+_WS_RELAY_REQUIRED_PERMISSIONS = [
+    "tools.read",
+    "tools.execute",
+    "resources.read",
+    "prompts.read",
+    "servers.use",
+    "a2a.read",
+]
+
+
+def _get_websocket_bearer_token(websocket: WebSocket) -> Optional[str]:
+    """Extract bearer token from WebSocket Authorization headers.
+
+    Args:
+        websocket: Incoming WebSocket connection.
+
+    Returns:
+        Bearer token value when present, otherwise None.
+    """
+    return extract_websocket_bearer_token(
+        getattr(websocket, "query_params", {}),
+        getattr(websocket, "headers", {}),
+        query_param_warning="WebSocket authentication token passed via query parameter",
+    )
+
+
+async def _authenticate_websocket_user(websocket: WebSocket) -> tuple[Optional[str], Optional[str]]:
+    """Authenticate and authorize a WebSocket relay connection.
+
+    Args:
+        websocket: Incoming WebSocket connection.
+
+    Returns:
+        A tuple of `(auth_token, proxy_user)` where each value may be None.
+
+    Raises:
+        HTTPException: If authentication fails or required permissions are missing.
+    """
+    auth_required = settings.mcp_client_auth_enabled or settings.auth_required
+    auth_token = _get_websocket_bearer_token(websocket)
+    proxy_user: Optional[str] = None
+    user_context: Optional[dict[str, Any]] = None
+
+    # JWT authentication path
+    if auth_token:
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=auth_token)
+        try:
+            user = await get_current_user(credentials, request=websocket)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication failed") from exc
+        user_context = {
+            "email": user.email,
+            "full_name": user.full_name,
+            "is_admin": user.is_admin,
+            "ip_address": websocket.client.host if websocket.client else None,
+            "user_agent": websocket.headers.get("user-agent"),
+            "team_id": getattr(websocket.state, "team_id", None),
+            "token_teams": getattr(websocket.state, "token_teams", None),
+            "token_use": getattr(websocket.state, "token_use", None),
+        }
+    # Proxy authentication path (only valid when MCP client auth is disabled)
+    elif is_proxy_auth_trust_active(settings):
+        proxy_user = websocket.headers.get(settings.proxy_user_header)
+        if proxy_user:
+            user_context = {
+                "email": proxy_user,
+                "full_name": proxy_user,
+                "is_admin": False,
+                "ip_address": websocket.client.host if websocket.client else None,
+                "user_agent": websocket.headers.get("user-agent"),
+            }
+        elif auth_required:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    elif auth_required:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+
+    # RBAC gate: require at least one MCP interaction permission before allowing WS relay access
+    if user_context:
+        checker = PermissionChecker(user_context)
+        if not await checker.has_any_permission(_WS_RELAY_REQUIRED_PERMISSIONS):
+            logger.warning("WebSocket relay permission denied: user=%s", user_context.get("email"))
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=_ACCESS_DENIED_MSG)
+
+    return auth_token, proxy_user
+
+
+@utility_router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """
+    Handle WebSocket connection to relay JSON-RPC requests to the internal RPC endpoint.
+
+    Accepts incoming text messages, parses them as JSON-RPC requests, sends them to /rpc,
+    and returns the result to the client over the same WebSocket.
+
+    Args:
+        websocket: The WebSocket connection instance.
+    """
+    try:
+        if not settings.mcpgateway_ws_relay_enabled:
+            await websocket.close(code=1008, reason="WebSocket relay is disabled")
+            return
+
+        try:
+            auth_token, proxy_user = await _authenticate_websocket_user(websocket)
+        except HTTPException as e:
+            await websocket.close(code=1008, reason=str(e.detail))
+            return
+
+        # Capture passthrough headers from the WebSocket handshake request.
+        # Without this, headers like X-Upstream-Authorization are silently dropped. See #3640.
+        # First-Party
+        from mcpgateway.utils.passthrough_headers import filter_loopback_skip_headers, safe_extract_headers_for_loopback  # pylint: disable=import-outside-toplevel
+
+        ws_passthrough_headers = safe_extract_headers_for_loopback(dict(websocket.headers), "WebSocket")
+
+        await websocket.accept()
+        while True:
+            try:
+                data = await websocket.receive_text()
+                client_args = {"timeout": settings.federation_timeout, "verify": internal_loopback_verify()}
+
+                # Build headers for /rpc request - forward auth credentials
+                rpc_headers: Dict[str, str] = {"Content-Type": "application/json"}
+                if auth_token:
+                    rpc_headers["Authorization"] = f"Bearer {auth_token}"
+                if proxy_user:
+                    rpc_headers[settings.proxy_user_header] = proxy_user
+                # Forward passthrough headers captured from the WebSocket handshake (see #3640).
+                # Defense-in-depth: filter via filter_loopback_skip_headers() so passthrough
+                # can never override the gateway's internal auth, content-type, or session/routing headers.
+                if ws_passthrough_headers:
+                    rpc_headers.update(filter_loopback_skip_headers(ws_passthrough_headers))
+
+                async with ResilientHttpClient(client_args=client_args) as client:
+                    response = await client.post(
+                        f"{internal_loopback_base_url()}{settings.app_root_path}/rpc",
+                        json=orjson.loads(data),
+                        headers=rpc_headers,
+                    )
+                    await websocket.send_text(response.text)
+            except JSONRPCError as e:
+                await websocket.send_text(orjson.dumps(e.to_dict()).decode())
+            except orjson.JSONDecodeError:
+                await websocket.send_text(
+                    orjson.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32700, "message": "Parse error"},
+                            "id": None,
+                        }
+                    ).decode()
+                )
+            except Exception as e:
+                logger.error(f"WebSocket error: {str(e)}")
+                await websocket.close(code=1011)
+                break
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket connection error: {str(e)}")
+        try:
+            await websocket.close(code=1011)
+        except Exception as er:
+            logger.error(f"Error while closing WebSocket: {er}")
+
+
+@utility_router.get("/sse")
+@require_permission("servers.use")
+async def utility_sse_endpoint(request: Request, user=Depends(get_current_user_with_permissions)):
+    """
+    Establish a Server-Sent Events (SSE) connection for real-time updates.
+
+    Args:
+        request (Request): The incoming HTTP request.
+        user (str): Authenticated username.
+
+    Returns:
+        StreamingResponse: A streaming response that keeps the connection
+        open and pushes events to the client.
+
+    Raises:
+        HTTPException: Returned with **500 Internal Server Error** if the SSE connection cannot be established or an unexpected error occurs while creating the transport.
+        asyncio.CancelledError: If the request is cancelled during SSE setup.
+    """
+    try:
+        logger.debug("User %s requested SSE connection", user)
+        base_url = update_url_protocol(request)
+
+        # SSE transport generates its own session_id - server-initiated, not client-provided
+        transport = SSETransport(base_url=base_url)
+        await transport.connect()
+        await session_registry.add_session(transport.session_id, transport)
+        await session_registry.set_session_owner(transport.session_id, get_user_email(user))
+
+        # Defensive cleanup callback - runs immediately on client disconnect
+        async def on_disconnect_cleanup() -> None:
+            """Clean up session when SSE client disconnects."""
+            try:
+                await session_registry.remove_session(transport.session_id)
+                logger.debug("Defensive session cleanup completed: %s", transport.session_id)
+            except Exception as e:
+                logger.warning("Defensive session cleanup failed for %s: %s", transport.session_id, e)
+
+        # Extract auth token from request (header OR cookie, like get_current_user_with_permissions)
+        auth_token = None
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            auth_token = auth_header[7:]
+        elif hasattr(request, "cookies") and request.cookies:
+            # Cookie auth (admin UI sessions)
+            auth_token = request.cookies.get("jwt_token") or request.cookies.get("access_token")
+
+        # Extract and normalize token teams
+        # Returns None if no JWT payload (non-JWT auth), or list if JWT exists
+        # SECURITY: Preserve None vs [] distinction for admin bypass:
+        # - None: unrestricted (admin keeps bypass, non-admin gets their accessible resources)
+        # - []: public-only (admin bypass disabled)
+        # - [...]: team-scoped access
+        token_teams = _get_token_teams_from_request(request)
+
+        # Preserve is_admin from user object (for cookie-authenticated admins)
+        is_admin = False
+        if hasattr(user, "is_admin"):
+            is_admin = getattr(user, "is_admin", False)
+        elif isinstance(user, dict):
+            is_admin = user.get("is_admin", False) or user.get("user", {}).get("is_admin", False)
+
+        # Create enriched user dict
+        user_with_token = dict(user) if isinstance(user, dict) else {"email": getattr(user, "email", str(user))}
+        user_with_token["auth_token"] = auth_token
+        user_with_token["token_teams"] = token_teams  # None for unrestricted, [] for public-only, [...] for team-scoped
+        user_with_token["is_admin"] = is_admin  # Preserve admin status for fallback token
+
+        # Capture passthrough headers from the original SSE request for loopback /rpc calls.
+        # Without this, headers like X-Upstream-Authorization are silently dropped. See #3640.
+        # First-Party
+        from mcpgateway.utils.passthrough_headers import safe_extract_headers_for_loopback  # pylint: disable=import-outside-toplevel
+
+        user_with_token["_passthrough_headers"] = safe_extract_headers_for_loopback(dict(request.headers), "SSE")
+
+        # Create respond task and register for cancellation on disconnect
+        respond_task = asyncio.create_task(session_registry.respond(None, user_with_token, session_id=transport.session_id))
+        session_registry.register_respond_task(transport.session_id, respond_task)
+
+        try:
+            response = await transport.create_sse_response(request, on_disconnect_callback=on_disconnect_cleanup)
+        except asyncio.CancelledError:
+            # Request cancelled - still need to clean up to prevent orphaned tasks
+            logger.debug("SSE request cancelled for %s, cleaning up", transport.session_id)
+            try:
+                await session_registry.remove_session(transport.session_id)
+            except Exception as cleanup_error:
+                logger.warning("Cleanup after SSE cancellation failed: %s", cleanup_error)
+            raise  # Re-raise CancelledError
+        except Exception as sse_error:
+            # CRITICAL: Cleanup on failure - respond task and session would be orphaned otherwise
+            logger.error("create_sse_response failed for %s: %s", transport.session_id, sse_error)
+            try:
+                await session_registry.remove_session(transport.session_id)
+            except Exception as cleanup_error:
+                logger.warning("Cleanup after SSE failure also failed: %s", cleanup_error)
+            raise
+
+        tasks = BackgroundTasks()
+        tasks.add_task(session_registry.remove_session, transport.session_id)
+        response.background = tasks
+        logger.info("SSE connection established: %s", transport.session_id)
+        return response
+    except Exception as e:
+        logger.error("SSE connection error: %s", e)
+        raise HTTPException(status_code=500, detail="SSE connection failed")
+
+
+@utility_router.post("/message")
+@require_permission("tools.execute")
+async def utility_message_endpoint(request: Request, user=Depends(get_current_user_with_permissions)):
+    """
+    Handle a JSON-RPC message directed to a specific SSE session.
+
+    Args:
+        request (Request): Incoming request containing the JSON-RPC payload.
+        user (str): Authenticated user.
+
+    Returns:
+        JSONResponse: ``{"status": "success"}`` with HTTP 202 on success.
+
+    Raises:
+        HTTPException: * **400 Bad Request** - ``session_id`` query parameter is missing or the payload cannot be parsed as JSON.
+            * **500 Internal Server Error** - An unexpected error occurs while broadcasting the message.
+    """
+    try:
+        logger.debug("User %s sent a message to SSE session", user)
+
+        session_id = request.query_params.get("session_id")
+        if not session_id:
+            logger.error("Missing session_id in message request")
+            raise HTTPException(status_code=400, detail="Missing session_id")
+        set_trace_session_id(session_id)
+
+        await _assert_session_owner_or_admin(request, user, session_id)
+
+        message = await _read_request_json(request)
+
+        await session_registry.broadcast(
+            session_id=session_id,
+            message=message,
+        )
+
+        return ORJSONResponse(content={"status": "success"}, status_code=202)
+
+    except ValueError as e:
+        logger.error("Invalid message format: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Message handling error: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to process message")
+
+
+@utility_router.post("/logging/setLevel")
+@require_permission("admin.system_config")
+async def set_log_level(request: Request, user=Depends(get_current_user_with_permissions)) -> None:
+    """
+    Update the server's log level at runtime.
+
+    Args:
+        request: HTTP request with log level JSON body.
+        user: Authenticated user.
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested to set log level")
+    body = await _read_request_json(request)
+    level = LogLevel(body["level"])
+    await logging_service.set_level(level)
+
+
+####################
+# Metrics          #
+####################
+@metrics_router.get("", response_model=MetricsResponse)
+@require_permission("admin.metrics")
+async def get_metrics(db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> MetricsResponse:
+    """
+    Retrieve aggregated metrics for all entity types (Tools, Resources, Servers, Prompts, A2A Agents).
+
+    Args:
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        A MetricsResponse with keys for each entity type and their aggregated metrics.
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested aggregated metrics")
+    tool_metrics = await tool_service.aggregate_metrics(db)
+    resource_metrics = await resource_service.aggregate_metrics(db)
+    server_metrics = await server_service.aggregate_metrics(db)
+    prompt_metrics = await prompt_service.aggregate_metrics(db)
+
+    kwargs = {
+        "tools": tool_metrics,
+        "resources": resource_metrics,
+        "servers": server_metrics,
+        "prompts": prompt_metrics,
+    }
+
+    if a2a_service and settings.mcpgateway_a2a_metrics_enabled:
+        kwargs["a2a_agents"] = await a2a_service.aggregate_metrics(db)
+
+    return MetricsResponse(**kwargs)
+
+
+@metrics_router.post("/reset", response_model=dict)
+@require_permission("admin.metrics")
+async def reset_metrics(entity: Optional[str] = None, entity_id: Optional[int] = None, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)) -> dict:
+    """
+    Reset metrics for a specific entity type and optionally a specific entity ID,
+    or perform a global reset if no entity is specified.
+
+    Args:
+        entity: One of "tool", "resource", "server", "prompt", "a2a_agent", or None for global reset.
+        entity_id: Specific entity ID to reset metrics for (optional).
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        A success message in a dictionary.
+
+    Raises:
+        HTTPException: If an invalid entity type is specified.
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested metrics reset for entity: {entity}, id: {entity_id}")
+    if entity is None:
+        # Global reset
+        await tool_service.reset_metrics(db)
+        await resource_service.reset_metrics(db)
+        await server_service.reset_metrics(db)
+        await prompt_service.reset_metrics(db)
+        if a2a_service and settings.mcpgateway_a2a_metrics_enabled:
+            await a2a_service.reset_metrics(db)
+    elif entity.lower() == "tool":
+        await tool_service.reset_metrics(db, entity_id)
+    elif entity.lower() == "resource":
+        await resource_service.reset_metrics(db)
+    elif entity.lower() == "server":
+        await server_service.reset_metrics(db)
+    elif entity.lower() == "prompt":
+        await prompt_service.reset_metrics(db)
+    elif entity.lower() in ("a2a_agent", "a2a"):
+        if a2a_service and settings.mcpgateway_a2a_metrics_enabled:
+            await a2a_service.reset_metrics(db, str(entity_id) if entity_id is not None else None)
+        else:
+            raise HTTPException(status_code=400, detail="A2A features are disabled")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid entity type for metrics reset")
+    return {"status": "success", "message": f"Metrics reset for {entity if entity else 'all entities'}"}
+
+
+####################
+# Healthcheck      #
+####################
+@app.get("/health")
+def healthcheck(response: Response = None):
+    """
+    Perform a basic health check to verify database connectivity.
+
+    Sync function so FastAPI runs it in a threadpool, avoiding event loop blocking.
+    Uses a dedicated session to avoid cross-thread issues and double-commit
+    from get_db dependency. All DB operations happen in the same thread.
+
+    Args:
+        response: Optional response object used to attach runtime-mode headers.
+
+    Returns:
+        A dictionary with the health status and optional error message.
+    """
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        # Explicitly commit to release PgBouncer backend connection in transaction mode.
+        db.commit()
+        if response is not None:
+            _apply_runtime_mode_headers(response)
+        return {"status": "healthy", "mcp_runtime": _mcp_runtime_status_payload()}
+    except Exception as e:
+        # Rollback, then invalidate if rollback fails (mirrors get_db cleanup).
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        error_message = f"Database connection error: {str(e)}"
+        logger.error(error_message)
+        if response is not None:
+            _apply_runtime_mode_headers(response)
+        return {"status": "unhealthy", "error": error_message, "mcp_runtime": _mcp_runtime_status_payload()}
+    finally:
+        db.close()
+
+
+def _check_db_ready() -> tuple[bool, str | None]:
+    """
+    Check database connectivity in a thread-safe manner.
+
+    Returns:
+        tuple: (success: bool, error_message: str | None)
+    """
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        # Explicitly commit to release PgBouncer backend connection in transaction mode.
+        db.commit()
+        return (True, None)
+    except Exception as e:
+        # Rollback, then invalidate if rollback fails (mirrors get_db cleanup).
+        try:
+            db.rollback()
+        except Exception:
+            try:
+                db.invalidate()
+            except Exception:
+                pass  # nosec B110 - Best effort cleanup on connection failure
+        return (False, str(e))
+    finally:
+        db.close()
+
+
+@app.get("/ready", response_model=HealthCheckResponse)
+async def readiness_check(response: Response):
+    """
+    Perform a comprehensive readiness check to verify all dependencies.
+
+    This endpoint checks:
+    - Database connectivity (via asyncio.to_thread to avoid blocking)
+    - Cache availability (if enabled)
+
+    Returns HTTP 200 when ready, HTTP 503 when not ready.
+
+    Args:
+        response: Response object used to attach runtime-mode headers and status code.
+
+    Returns:
+        A HealthCheckResponse with detailed component health status.
+        HTTP 200 if all components are healthy (ready).
+        HTTP 503 if any component is unhealthy (not ready).
+    """
+    status_items = []
+
+    # Database health check (run in thread to avoid blocking event loop)
+    db_success, db_error = await asyncio.to_thread(_check_db_ready)
+
+    if db_success:
+        status_items.append(HealthStatusItem(name="Database", status_code=status.HTTP_200_OK, message="Database Connection Successful"))
+    else:
+        error_message = f"Database health check failed: {db_error}"
+        logger.error(error_message)
+        status_items.append(HealthStatusItem(name="Database", status_code=status.HTTP_503_SERVICE_UNAVAILABLE, message="Cannot connect to Database"))
+
+    # Check Redis health only if it's enabled (cache_type is redis and redis_url is configured)
+    redis_enabled = settings.cache_type == "redis" and settings.redis_url
+    if redis_enabled:
+        try:
+            # is_redis_available() checks if Redis is available and responding to ping.
+            if await is_redis_available():
+                status_items.append(HealthStatusItem(name="Cache", status_code=status.HTTP_200_OK, message="Cache Connection Successful"))
+            else:
+                status_items.append(HealthStatusItem(name="Cache", status_code=status.HTTP_503_SERVICE_UNAVAILABLE, message="Cannot connect to Cache"))
+        except Exception as e:
+            logger.error(f"Redis health check failed: {str(e)}")
+            status_items.append(HealthStatusItem(name="Cache", status_code=status.HTTP_503_SERVICE_UNAVAILABLE, message="Cannot connect to Cache"))
+
+    # Determine overall status:
+    # - "ready" if Database is healthy (200) AND Redis is healthy when enabled
+    # - "unready" if Database is unhealthy (503) OR Redis is unhealthy when enabled
+    database_status = next((item for item in status_items if item.name == "Database"), None)
+    redis_status = next((item for item in status_items if item.name == "Cache"), None)
+
+    # Check database health
+    database_healthy = database_status and database_status.status_code == 200
+
+    # Redis is healthy if: not enabled OR (enabled AND status is 200)
+    redis_healthy = not redis_enabled or (redis_status and redis_status.status_code == 200)
+
+    is_ready = database_healthy and redis_healthy
+    overall_status = "ready" if is_ready else "unready"
+
+    # Set HTTP status code: 200 for ready, 503 for unready
+    response.status_code = status.HTTP_200_OK if is_ready else status.HTTP_503_SERVICE_UNAVAILABLE
+
+    _apply_runtime_mode_headers(response)
+    return HealthCheckResponse(status=overall_status, status_items=status_items, mcp_runtime=_mcp_runtime_status_payload())
+
+
+@app.get("/health/security", tags=["health"])
+async def security_health(request: Request, _user=Depends(require_admin_auth)):  # pylint: disable=unused-argument
+    """
+    Get the security configuration health status (admin only).
+
+    Args:
+        request (Request): The incoming HTTP request.
+        _user: Authenticated admin user (injected by require_admin_auth).
+
+    Returns:
+        dict: A dictionary containing the overall security health status, score,
+            individual checks, warning count, and timestamp.
+    """
+    security_status = settings.get_security_status()
+
+    # Determine overall health
+    score = security_status["security_score"]
+    is_healthy = score >= 60  # Minimum acceptable score
+
+    # Build response
+    response = {
+        "status": "healthy" if is_healthy else "unhealthy",
+        "score": score,
+        "checks": {
+            "authentication": security_status["auth_enabled"],
+            "secure_secrets": security_status["secure_secrets"],
+            "ssl_verification": security_status["ssl_verification"],
+            "debug_disabled": security_status["debug_disabled"],
+            "cors_restricted": security_status["cors_restricted"],
+            "ui_protected": security_status["ui_protected"],
+        },
+        "warning_count": len(security_status["warnings"]),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # Include warnings for admin users
+    if security_status["warnings"]:
+        response["warnings"] = security_status["warnings"]
+
+    return response
+
+
+####################
+# Tag Endpoints    #
+####################
+
+
+@tag_router.get("", response_model=List[TagInfo])
+@tag_router.get("/", response_model=List[TagInfo])
+@require_permission("tags.read")
+async def list_tags(
+    request: Request,
+    entity_types: Optional[str] = None,
+    include_entities: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> List[TagInfo]:
+    """
+    Retrieve all unique tags across specified entity types.
+
+    Args:
+        request: FastAPI request object used to derive token/team visibility scope
+        entity_types: Comma-separated list of entity types to filter by
+                     (e.g., "tools,resources,prompts,servers,gateways").
+                     If not provided, returns tags from all entity types.
+        include_entities: Whether to include the list of entities that have each tag
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        List of TagInfo objects containing tag names, statistics, and optionally entities
+
+    Raises:
+        HTTPException: If tag retrieval fails
+    """
+    # Parse entity types parameter if provided
+    entity_types_list = None
+    if entity_types:
+        entity_types_list = [et.strip().lower() for et in entity_types.split(",") if et.strip()]
+
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is retrieving tags for entity types: {entity_types_list}, include_entities: {include_entities}")
+
+    try:
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+        if is_admin and token_teams is None:
+            user_email = None
+        elif token_teams is None:
+            token_teams = []
+
+        tags = await tag_service.get_all_tags(
+            db,
+            entity_types=entity_types_list,
+            include_entities=include_entities,
+            user_email=user_email,
+            token_teams=token_teams,
+        )
+        return tags
+    except Exception as e:
+        logger.error(f"Failed to retrieve tags: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve tags: {str(e)}")
+
+
+@tag_router.get("/{tag_name}/entities", response_model=List[TaggedEntity])
+@require_permission("tags.read")
+async def get_entities_by_tag(
+    request: Request,
+    tag_name: str,
+    entity_types: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> List[TaggedEntity]:
+    """
+    Get all entities that have a specific tag.
+
+    Args:
+        request: FastAPI request object used to derive token/team visibility scope
+        tag_name: The tag to search for
+        entity_types: Comma-separated list of entity types to filter by
+                     (e.g., "tools,resources,prompts,servers,gateways").
+                     If not provided, returns entities from all types.
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        List of TaggedEntity objects
+
+    Raises:
+        HTTPException: If entity retrieval fails
+    """
+    # Parse entity types parameter if provided
+    entity_types_list = None
+    if entity_types:
+        entity_types_list = [et.strip().lower() for et in entity_types.split(",") if et.strip()]
+
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} is retrieving entities for tag '{tag_name}' with entity types: {entity_types_list}")
+
+    try:
+        user_email, token_teams, is_admin = _get_rpc_filter_context(request, user)
+        if is_admin and token_teams is None:
+            user_email = None
+        elif token_teams is None:
+            token_teams = []
+
+        entities = await tag_service.get_entities_by_tag(
+            db,
+            tag_name=tag_name,
+            entity_types=entity_types_list,
+            user_email=user_email,
+            token_teams=token_teams,
+        )
+        return entities
+    except Exception as e:
+        logger.error(f"Failed to retrieve entities for tag '{tag_name}': {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve entities: {str(e)}")
+
+
+####################
+# Export/Import    #
+####################
+
+
+@export_import_router.get("/export", response_model=Dict[str, Any])
+@require_permission("admin.export")
+async def export_configuration(
+    request: Request,  # pylint: disable=unused-argument
+    export_format: str = "json",  # pylint: disable=unused-argument
+    types: Optional[str] = None,
+    exclude_types: Optional[str] = None,
+    tags: Optional[str] = None,
+    include_inactive: bool = False,
+    include_dependencies: bool = True,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Export gateway configuration to JSON format.
+
+    Args:
+        request: FastAPI request object for extracting root path
+        export_format: Export format (currently only 'json' supported)
+        types: Comma-separated list of entity types to include (tools,gateways,servers,prompts,resources,roots)
+        exclude_types: Comma-separated list of entity types to exclude
+        tags: Comma-separated list of tags to filter by
+        include_inactive: Whether to include inactive entities
+        include_dependencies: Whether to include dependent entities
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        Export data in the specified format
+
+    Raises:
+        HTTPException: If export fails
+    """
+    try:
+        logger.info(f"User {SecurityValidator.sanitize_log_message(str(user))} requested configuration export")
+        username: Optional[str] = None
+        # Parse parameters
+        include_types = None
+        if types:
+            include_types = [t.strip() for t in types.split(",") if t.strip()]
+
+        exclude_types_list = None
+        if exclude_types:
+            exclude_types_list = [t.strip() for t in exclude_types.split(",") if t.strip()]
+
+        tags_list = None
+        if tags:
+            tags_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+        # Extract username from user (which is now an EmailUser object)
+        if hasattr(user, "email"):
+            username = getattr(user, "email", None)
+        elif isinstance(user, dict):
+            username = user.get("email", None)
+        else:
+            username = None
+
+        # Get root path for URL construction - prefer configured APP_ROOT_PATH
+        root_path = settings.app_root_path
+
+        # Derive team-scoped visibility from the requesting user's token
+        scoped_user_email, scoped_token_teams = _get_scoped_resource_access_context(request, user)
+
+        # Perform export
+        export_data = await export_service.export_configuration(
+            db=db,
+            include_types=include_types,
+            exclude_types=exclude_types_list,
+            tags=tags_list,
+            include_inactive=include_inactive,
+            include_dependencies=include_dependencies,
+            exported_by=username or "unknown",
+            root_path=root_path,
+            user_email=scoped_user_email,
+            token_teams=scoped_token_teams,
+        )
+
+        return export_data
+
+    except ExportError as e:
+        logger.error(f"Export failed for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected export error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+@export_import_router.post("/export/selective", response_model=Dict[str, Any])
+@require_permission("admin.export")
+async def export_selective_configuration(
+    request: Request, entity_selections: Dict[str, List[str]] = Body(...), include_dependencies: bool = True, db: Session = Depends(get_db), user=Depends(get_current_user_with_permissions)
+) -> Dict[str, Any]:
+    """
+    Export specific entities by their IDs/names.
+
+    Args:
+        request: FastAPI request object for token scope context
+        entity_selections: Dict mapping entity types to lists of IDs/names to export
+        include_dependencies: Whether to include dependent entities
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        Selective export data
+
+    Raises:
+        HTTPException: If export fails
+
+    Example request body:
+        {
+            "tools": ["tool1", "tool2"],
+            "servers": ["server1"],
+            "prompts": ["prompt1"]
+        }
+    """
+    try:
+        logger.info(f"User {SecurityValidator.sanitize_log_message(str(user))} requested selective configuration export")
+
+        username: Optional[str] = None
+        # Extract username from user (which is now an EmailUser object)
+        if hasattr(user, "email"):
+            username = getattr(user, "email", None)
+        elif isinstance(user, dict):
+            username = user.get("email")
+
+        # Get root path for URL construction - prefer configured APP_ROOT_PATH
+        root_path = settings.app_root_path
+
+        # Derive team-scoped visibility from the requesting user's token
+        scoped_user_email, scoped_token_teams = _get_scoped_resource_access_context(request, user)
+
+        export_data = await export_service.export_selective(
+            db=db,
+            entity_selections=entity_selections,
+            include_dependencies=include_dependencies,
+            exported_by=username or "unknown",
+            root_path=root_path,
+            user_email=scoped_user_email,
+            token_teams=scoped_token_teams,
+        )
+
+        return export_data
+
+    except ExportError as e:
+        logger.error(f"Selective export failed for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected selective export error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+
+@export_import_router.post("/import", response_model=Dict[str, Any])
+@require_permission("admin.import")
+async def import_configuration(
+    import_data: Dict[str, Any] = Body(...),
+    conflict_strategy: str = Body("update"),
+    dry_run: bool = Body(False),
+    rekey_secret: Optional[str] = Body(None),
+    selected_entities: Optional[Dict[str, List[str]]] = Body(None),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> Dict[str, Any]:
+    """
+    Import configuration data with conflict resolution.
+
+    Args:
+        import_data: The configuration data to import
+        conflict_strategy: How to handle conflicts: skip, update, rename, fail
+        dry_run: If true, validate but don't make changes
+        rekey_secret: New encryption secret for cross-environment imports
+        selected_entities: Dict of entity types to specific entity names/ids to import
+        db: Database session
+        user: Authenticated user
+
+    Returns:
+        Import status and results
+
+    Raises:
+        HTTPException: If import fails or validation errors occur
+    """
+    try:
+        if not import_data:
+            raise HTTPException(status_code=400, detail="Missing 'import_data' in request body")
+
+        logger.info(f"User {SecurityValidator.sanitize_log_message(str(user))} requested configuration import (dry_run={dry_run})")
+
+        # Validate conflict strategy
+        try:
+            strategy = ConflictStrategy(conflict_strategy.lower())
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid conflict strategy. Must be one of: {[s.value for s in list(ConflictStrategy)]}")
+
+        # Extract username from user (which is now an EmailUser object)
+        if hasattr(user, "email"):
+            username = getattr(user, "email", None)
+        elif isinstance(user, dict):
+            username = user.get("email", None)
+        else:
+            username = None
+
+        # Perform import
+        import_status = await import_service.import_configuration(
+            db=db, import_data=import_data, conflict_strategy=strategy, dry_run=dry_run, rekey_secret=rekey_secret, imported_by=username or "unknown", selected_entities=selected_entities
+        )
+
+        return import_status.to_dict()
+
+    except HTTPException:
+        raise
+    except ImportValidationError as e:
+        logger.error(f"Import validation failed for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Validation error: {str(e)}")
+    except ImportConflictError as e:
+        logger.error(f"Import conflict for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=409, detail=f"Conflict error: {str(e)}")
+    except ImportServiceError as e:
+        logger.error(f"Import failed for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected import error for user {SecurityValidator.sanitize_log_message(str(user))}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
+
+
+@export_import_router.get("/import/status/{import_id}", response_model=Dict[str, Any])
+@require_permission("admin.import")
+async def get_import_status(import_id: str, user=Depends(get_current_user_with_permissions)) -> Dict[str, Any]:
+    """
+    Get the status of an import operation.
+
+    Args:
+        import_id: The import operation ID
+        user: Authenticated user
+
+    Returns:
+        Import status information
+
+    Raises:
+        HTTPException: If import not found
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested import status for {import_id}")
+
+    import_status = import_service.get_import_status(import_id)
+    if not import_status:
+        raise HTTPException(status_code=404, detail=f"Import {import_id} not found")
+
+    return import_status.to_dict()
+
+
+@export_import_router.get("/import/status", response_model=List[Dict[str, Any]])
+@require_permission("admin.import")
+async def list_import_statuses(user=Depends(get_current_user_with_permissions)) -> List[Dict[str, Any]]:
+    """
+    List all import operation statuses.
+
+    Args:
+        user: Authenticated user
+
+    Returns:
+        List of import status information
+    """
+    logger.debug(f"User {SecurityValidator.sanitize_log_message(str(user))} requested all import statuses")
+
+    statuses = import_service.list_import_statuses()
+    return [status.to_dict() for status in statuses]
+
+
+@export_import_router.post("/import/cleanup", response_model=Dict[str, Any])
+@require_permission("admin.import")
+async def cleanup_import_statuses(max_age_hours: int = 24, user=Depends(get_current_user_with_permissions)) -> Dict[str, Any]:
+    """
+    Clean up completed import statuses older than specified age.
+
+    Args:
+        max_age_hours: Maximum age in hours for keeping completed imports
+        user: Authenticated user
+
+    Returns:
+        Cleanup results
+    """
+    logger.info(f"User {SecurityValidator.sanitize_log_message(str(user))} requested import status cleanup (max_age_hours={max_age_hours})")
+
+    removed_count = import_service.cleanup_completed_imports(max_age_hours)
+    return {"status": "success", "message": f"Cleaned up {removed_count} completed import statuses", "removed_count": removed_count}
+
+
+# Mount static files
+# app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="static")
+
+# Include routers
+app.include_router(version_router)
+app.include_router(protocol_router)
+app.include_router(tool_router)
+app.include_router(resource_router)
+app.include_router(prompt_router)
+app.include_router(gateway_router)
+app.include_router(root_router)
+app.include_router(utility_router)
+app.include_router(server_router)
+app.include_router(server_well_known_router, prefix="/servers")
+app.include_router(metrics_router)
+app.include_router(tag_router)
+app.include_router(export_import_router)
+
+# Tool plugin bindings router
+try:
+    # First-Party
+    from mcpgateway.routers.tool_plugin_bindings import router as tool_plugin_bindings_router  # pylint: disable=import-outside-toplevel
+
+    app.include_router(tool_plugin_bindings_router)
+    logger.info("Tool plugin bindings router included")
+except ImportError as e:
+    logger.error(f"Tool plugin bindings router not available: {e}")
+
+# Include log search router if structured logging is enabled
+if getattr(settings, "structured_logging_enabled", True):
+    try:
+        # First-Party
+        from mcpgateway.routers.log_search import router as log_search_router
+
+        app.include_router(log_search_router)
+        logger.info("Log search router included - structured logging enabled")
+    except ImportError as e:
+        logger.warning(f"Failed to import log search router: {e}")
+else:
+    logger.info("Log search router not included - structured logging disabled")
+
+# Conditionally include observability router if enabled
+if settings.observability_enabled:
+    # First-Party
+    from mcpgateway.routers.observability import router as observability_router
+
+    app.include_router(observability_router)
+    logger.info("Observability router included - observability API endpoints enabled")
+else:
+    logger.info("Observability router not included - observability disabled")
+
+# Conditionally include metrics maintenance router if cleanup or rollup is enabled
+if settings.metrics_cleanup_enabled or settings.metrics_rollup_enabled:
+    # First-Party
+    from mcpgateway.routers.metrics_maintenance import router as metrics_maintenance_router
+
+    app.include_router(metrics_maintenance_router)
+    logger.info("Metrics maintenance router included - cleanup/rollup API endpoints enabled")
+
+# Conditionally include A2A router if A2A features are enabled
+if settings.mcpgateway_a2a_enabled:
+    app.include_router(a2a_router)
+    logger.info("A2A router included - A2A features enabled")
+else:
+    logger.info("A2A router not included - A2A features disabled")
+
+app.include_router(well_known_router)
+
+# Include Email Authentication router if enabled
+if settings.email_auth_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.auth import auth_router
+        from mcpgateway.routers.email_auth import email_auth_router
+
+        app.include_router(email_auth_router, prefix="/auth/email", tags=["Email Authentication"])
+        app.include_router(auth_router, tags=["Main Authentication"])
+        logger.info("Authentication routers included - Auth enabled")
+
+        # Include SSO router if enabled
+        if settings.sso_enabled:
+            try:
+                # First-Party
+                from mcpgateway.routers.sso import sso_router
+
+                app.include_router(sso_router, tags=["SSO Authentication"])
+                logger.info("SSO router included - SSO authentication enabled")
+            except ImportError as e:
+                logger.error(f"SSO router not available: {e}")
+        else:
+            logger.info("SSO router not included - SSO authentication disabled")
+    except ImportError as e:
+        logger.error(f"Authentication routers not available: {e}")
+else:
+    logger.info("Email authentication router not included - Email auth disabled")
+
+# Include Team Management router if email auth is enabled
+if settings.email_auth_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.teams import teams_router
+
+        app.include_router(teams_router, prefix="/teams", tags=["Teams"])
+        logger.info("Team management router included - Teams enabled with email auth")
+    except ImportError as e:
+        logger.error(f"Team management router not available: {e}")
+else:
+    logger.info("Team management router not included - Email auth disabled")
+
+# Include JWT Token Catalog router if email auth is enabled
+if settings.email_auth_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.tokens import router as tokens_router
+
+        app.include_router(tokens_router, tags=["JWT Token Catalog"])
+        logger.info("JWT Token Catalog router included - Token management enabled with email auth")
+    except ImportError as e:
+        logger.error(f"JWT Token Catalog router not available: {e}")
+else:
+    logger.info("JWT Token Catalog router not included - Email auth disabled")
+
+# Include RBAC router if email auth is enabled
+if settings.email_auth_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.rbac import router as rbac_router
+
+        app.include_router(rbac_router, tags=["RBAC"])
+        logger.info("RBAC router included - Role-based access control enabled")
+    except ImportError as e:
+        logger.error(f"RBAC router not available: {e}")
+else:
+    logger.info("RBAC router not included - Email auth disabled")
+
+# Include OAuth router
+try:
+    # First-Party
+    from mcpgateway.routers.oauth_router import oauth_router
+
+    app.include_router(oauth_router)
+    logger.info("OAuth router included")
+except ImportError:
+    logger.debug("OAuth router not available")
+
+# Include reverse proxy router if enabled
+if settings.mcpgateway_reverse_proxy_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.reverse_proxy import router as reverse_proxy_router
+
+        app.include_router(reverse_proxy_router)
+        logger.info("Reverse proxy router included")
+    except ImportError:
+        logger.debug("Reverse proxy router not available")
+else:
+    logger.info("Reverse proxy router not included - feature disabled")
+
+# Include LLMChat router
+if settings.llmchat_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.llmchat_router import llmchat_router
+
+        app.include_router(llmchat_router)
+        logger.info("LLM Chat router included")
+    except ImportError:
+        logger.debug("LLM Chat router not available")
+
+    # Include LLM configuration and proxy routers (internal API)
+    try:
+        # First-Party
+        from mcpgateway.routers.llm_admin_router import llm_admin_router
+        from mcpgateway.routers.llm_config_router import llm_config_router
+        from mcpgateway.routers.llm_proxy_router import llm_proxy_router
+
+        app.include_router(llm_config_router, prefix="/llm", tags=["LLM Configuration"])
+        app.include_router(llm_proxy_router, prefix=settings.llm_api_prefix, tags=["LLM Proxy"])
+        app.include_router(llm_admin_router, prefix="/admin/llm", tags=["LLM Admin"])
+        logger.info("LLM configuration, proxy, and admin routers included")
+    except ImportError as e:
+        logger.debug(f"LLM routers not available: {e}")
+
+# Include Toolops router
+if settings.toolops_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.toolops_router import toolops_router
+
+        app.include_router(toolops_router)
+        logger.info("Toolops router included")
+    except ImportError:
+        logger.debug("Toolops router not available")
+
+# Cancellation router (tool cancellation endpoints)
+if settings.mcpgateway_tool_cancellation_enabled:
+    try:
+        # First-Party
+        from mcpgateway.routers.cancellation_router import router as cancellation_router
+
+        app.include_router(cancellation_router)
+        logger.info("Cancellation router included (tool cancellation enabled)")
+    except ImportError:
+        logger.debug("Orchestrate router not available")
+else:
+    logger.info("Tool cancellation feature disabled - cancellation endpoints not available")
+
+# Feature flags for admin UI and API
+UI_ENABLED = settings.mcpgateway_ui_enabled
+ADMIN_API_ENABLED = settings.mcpgateway_admin_api_enabled
+logger.info(f"Admin UI enabled: {UI_ENABLED}")
+logger.info(f"Admin API enabled: {ADMIN_API_ENABLED}")
+
+# Conditional UI and admin API handling
+if ADMIN_API_ENABLED:
+    logger.info("Including admin_router - Admin API enabled")
+    # Lazy import: mcpgateway.admin is a large module (~19k lines, ~120ms cold).
+    # Only load it when the admin API is actually mounted.
+    # First-Party
+    from mcpgateway.admin import admin_router, set_logging_service, validate_section_permissions  # pylint: disable=import-outside-toplevel
+
+    set_logging_service(logging_service)
+    app.include_router(admin_router)  # Admin routes imported from admin.py
+
+    # Validate section-to-permission mapping consistency at startup
+    validate_section_permissions(admin_router)
+
+    # Runtime-mode admin endpoints (GET/PATCH /admin/runtime/{mcp,a2a}-mode).
+    # First-Party
+    from mcpgateway.routers.runtime_admin_router import runtime_admin_router  # pylint: disable=import-outside-toplevel
+
+    app.include_router(runtime_admin_router, prefix="/admin/runtime", tags=["Runtime Admin"])
+else:
+    logger.warning("Admin API routes not mounted - Admin API disabled via MCPGATEWAY_ADMIN_API_ENABLED=False")
+
+
+class MCPRuntimeHeaderTransportWrapper:
+    """Annotate Python-owned MCP transport responses with the active runtime marker."""
+
+    def __init__(self, transport_app, *, runtime_name: str) -> None:
+        """Wrap an MCP transport app and stamp a runtime header on responses.
+
+        Args:
+            transport_app: Underlying MCP transport app.
+            runtime_name: Runtime label to expose via response headers.
+        """
+        self.transport_app = transport_app
+        self.runtime_name = runtime_name.encode("ascii")
+
+    async def handle_streamable_http(self, scope, receive, send):
+        """Forward an MCP request while ensuring the runtime marker header is present.
+
+        Args:
+            scope: Incoming ASGI scope.
+            receive: ASGI receive callable.
+            send: ASGI send callable.
+        """
+
+        async def _send_with_runtime_header(message):
+            """Attach MCP runtime mode headers before sending the ASGI event downstream.
+
+            Args:
+                message: Outgoing ASGI message emitted by the wrapped application.
+            """
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                if not any(isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], (bytes, bytearray)) and item[0].lower() == b"x-contextforge-mcp-runtime" for item in headers):
+                    headers.append((b"x-contextforge-mcp-runtime", self.runtime_name))
+                if not any(
+                    isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], (bytes, bytearray)) and item[0].lower() == b"x-contextforge-mcp-session-core" for item in headers
+                ):
+                    headers.append((b"x-contextforge-mcp-session-core", _current_mcp_session_core_mode().encode("ascii")))
+                if not any(isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], (bytes, bytearray)) and item[0].lower() == b"x-contextforge-mcp-resume-core" for item in headers):
+                    headers.append((b"x-contextforge-mcp-resume-core", _current_mcp_resume_core_mode().encode("ascii")))
+                if not any(
+                    isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], (bytes, bytearray)) and item[0].lower() == b"x-contextforge-mcp-live-stream-core" for item in headers
+                ):
+                    headers.append((b"x-contextforge-mcp-live-stream-core", _current_mcp_live_stream_core_mode().encode("ascii")))
+                if not any(
+                    isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], (bytes, bytearray)) and item[0].lower() == b"x-contextforge-mcp-affinity-core" for item in headers
+                ):
+                    headers.append((b"x-contextforge-mcp-affinity-core", _current_mcp_affinity_core_mode().encode("ascii")))
+                if not any(
+                    isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], (bytes, bytearray)) and item[0].lower() == b"x-contextforge-mcp-session-auth-reuse" for item in headers
+                ):
+                    headers.append((b"x-contextforge-mcp-session-auth-reuse", _current_mcp_session_auth_reuse_mode().encode("ascii")))
+                message = dict(message)
+                message["headers"] = headers
+            await send(message)
+
+        await self.transport_app.handle_streamable_http(scope, receive, _send_with_runtime_header)
+
+
+def _select_mcp_ingress(_scope: dict) -> str:
+    """Pick the registered MCPIngressMount ingress to serve a request.
+
+    Single source of truth for the dispatch policy:
+
+    - Boot ``off`` / ``full`` (no dispatcher today): the mount isn't used;
+      the Python transport or the plain Rust proxy is mounted directly
+      from ``_build_mcp_transport_app``.
+    - Boot ``shadow`` / ``edge`` with no override OR an ``edge`` override
+      that satisfies the safety invariant: route to the Rust ingress
+      shape selected by ``settings.mcp_rust_ingress`` (``"public"`` for
+      nginx-style or ``"internal"`` for trusted Python→Rust forwarding).
+    - Override forces ``shadow``, OR safety invariant is unmet: route to
+      the Python transport (the always-safe fallback).
+
+    The ``"rust-public"`` ingress is only registered on ``boot=edge``
+    (the public listener isn't bound on shadow boot per the entrypoint
+    flow). On any other boot mode the selector transparently downgrades
+    a configured ``"public"`` choice to ``"rust-internal"`` to avoid
+    routing to an unregistered name; the misconfig itself is surfaced
+    as a boot-time error in ``_build_mcp_transport_app``.
+
+    Args:
+        _scope: ASGI scope (unused today; reserved so future selectors
+            can route by method/path/headers without changing the
+            mount's API).
+
+    Returns:
+        The ingress name to look up in the mount's registry.
+    """
+    if not _should_mount_public_rust_transport():
+        return "python"
+    if settings.mcp_rust_ingress == "public" and version_module.boot_mcp_runtime_mode() == "edge":
+        return "rust-public"
+    return "rust-internal"
+
+
+def _build_mcp_transport_app():
+    """Build the ASGI app to mount at public ``/mcp``.
+
+    Returns:
+        For boot modes ``shadow``/``edge``: an :class:`MCPIngressMount`
+        with the Python transport, the trusted-internal Rust proxy, and
+        (when supported) the nginx-style Rust public proxy registered.
+        For boot ``full``: the plain trusted-internal Rust proxy mounted
+        directly (no dispatcher — flipping ``full`` would orphan
+        Rust-held session/event-store state). For boot ``off``: the
+        Python transport. The ``/mcp`` mount calls
+        ``returned_app.handle_streamable_http`` (legacy interface kept
+        for backward compatibility with the existing mount line).
+    """
+    # First-Party
+    from mcpgateway.transports.mcp_ingress_mount import MCPIngressMount  # pylint: disable=import-outside-toplevel
+
+    boot_mode = version_module.boot_mcp_runtime_mode()
+    python_transport = MCPRuntimeHeaderTransportWrapper(streamable_http_session, runtime_name="python")
+
+    if boot_mode in ("shadow", "edge"):
+        # First-Party
+        from mcpgateway.transports.rust_mcp_runtime_proxy import RustMCPRuntimeProxy  # pylint: disable=import-outside-toplevel
+
+        rust_internal = RustMCPRuntimeProxy(streamable_http_session.handle_streamable_http)
+        ingress = MCPIngressMount(selector=_select_mcp_ingress, fallback=python_transport.handle_streamable_http)
+        ingress.register("python", python_transport.handle_streamable_http)
+        ingress.register("rust-internal", rust_internal.handle_streamable_http)
+
+        # Public-listener proxy is only meaningful when the safety invariant
+        # is met (i.e. boot=edge); shadow boot doesn't bind the public
+        # listener. Register it on edge so an operator can flip
+        # `settings.mcp_rust_ingress = "public"` without a restart.
+        if boot_mode == "edge":
+            # First-Party
+            from mcpgateway.transports.rust_mcp_public_proxy import build_rust_public_proxy_app  # pylint: disable=import-outside-toplevel
+
+            ingress.register("rust-public", build_rust_public_proxy_app())
+        elif settings.mcp_rust_ingress == "public":
+            # boot=shadow with mcp_rust_ingress=public is a misconfig: the
+            # Rust public listener isn't bound on shadow boot, so the
+            # selector deliberately downgrades to "rust-internal". Logged
+            # at error severity so it survives the default LOG_LEVEL=ERROR
+            # — a warning here would be invisible in most production
+            # deployments and the operator would never know their setting
+            # is being silently overridden.
+            logger.error(
+                "mcp_rust_ingress=public is set on boot=shadow; the Rust public listener isn't bound on shadow boot. "
+                "Selector will route to rust-internal instead. Switch boot mode to edge to honor the public ingress.",
+            )
+
+        logger.warning(
+            "MCP runtime mode: %s (boot=%s). Public /mcp dispatches via MCPIngressMount; ingresses=%s; current=%s. Runtime override may flip via PATCH /admin/runtime/mcp-mode.",
+            _current_mcp_runtime_mode(),
+            boot_mode,
+            ingress.names(),
+            _select_mcp_ingress({}),
+        )
+        # The legacy mount line calls .handle_streamable_http on the returned
+        # app; expose that name on a tiny shim so the mount line can stay
+        # unchanged. (.dispatch is the modern ASGI 3.0 callable.)
+        ingress.handle_streamable_http = ingress.dispatch  # type: ignore[attr-defined]
+        return ingress
+
+    if _should_mount_public_rust_transport():
+        logger.warning(
+            "MCP runtime mode: %s. GET/POST/DELETE /mcp requests will be proxied to %s. MCP session core mode: %s. MCP replay/resume core mode: %s. MCP live stream core mode: %s. MCP affinity core mode: %s. MCP session auth reuse mode: %s.",
+            _current_mcp_runtime_mode(),
+            settings.experimental_rust_mcp_runtime_uds or settings.experimental_rust_mcp_runtime_url,
+            _current_mcp_session_core_mode(),
+            _current_mcp_resume_core_mode(),
+            _current_mcp_live_stream_core_mode(),
+            _current_mcp_affinity_core_mode(),
+            _current_mcp_session_auth_reuse_mode(),
+        )
+        # First-Party
+        from mcpgateway.transports.rust_mcp_runtime_proxy import RustMCPRuntimeProxy  # pylint: disable=import-outside-toplevel
+
+        return RustMCPRuntimeProxy(streamable_http_session.handle_streamable_http)
+
+    if _rust_build_included():
+        logger.warning(
+            "MCP runtime mode: %s. Rust MCP artifacts are present in this image, but EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED=false so /mcp remains on the Python transport. Set RUST_MCP_MODE=edge or RUST_MCP_MODE=full to activate the Rust runtime with the simple env flow.",
+            _current_mcp_runtime_mode(),
+        )
+    else:
+        logger.info("MCP runtime mode: %s. /mcp is mounted on the Python transport.", _current_mcp_runtime_mode())
+
+    return python_transport
+
+
+class InternalTrustedMCPTransportBridge:
+    """Trusted internal bridge from Rust MCP transport requests to the Python session manager."""
+
+    def __init__(self, transport_app) -> None:
+        """Store the underlying Python transport app used for trusted forwarding.
+
+        Args:
+            transport_app: Python transport app that ultimately owns session handling.
+        """
+        self.transport_app = transport_app
+
+    async def handle_streamable_http(self, scope, receive, send):
+        """Translate trusted Rust transport requests into Python session-manager calls.
+
+        Args:
+            scope: Incoming ASGI scope.
+            receive: ASGI receive callable.
+            send: ASGI send callable.
+        """
+        if scope.get("type") != "http":
+            response = ORJSONResponse(status_code=404, content={"detail": "Not found"})
+            await response(scope, receive, send)
+            return
+
+        method = str(scope.get("method", "GET")).upper()
+        if method not in {"GET", "POST", "DELETE"}:
+            response = ORJSONResponse(status_code=405, content={"detail": "Method not allowed"})
+            await response(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+        try:
+            _build_internal_mcp_forwarded_user(request)
+        except HTTPException as exc:
+            response = ORJSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            await response(scope, receive, send)
+            return
+
+        auth_context = _get_internal_mcp_auth_context(request) or {}
+        server_id = request.headers.get("x-contextforge-server-id")
+        forwarded_scope = dict(scope)
+        forwarded_scope["path"] = "/mcp/"
+        forwarded_scope["modified_path"] = f"/servers/{server_id}/mcp" if server_id else "/mcp/"
+        forwarded_auth_method = auth_context.get("auth_method") or "mcp_internal_forward"
+
+        token = user_context_var.set(auth_context)
+        try:
+            set_trace_context_from_teams(
+                auth_context.get("teams"),
+                user_email=auth_context.get("email"),
+                is_admin=bool(auth_context.get("permission_is_admin", auth_context.get("is_admin", False))),
+                auth_method=forwarded_auth_method,
+                team_name=auth_context.get("team_name"),
+            )
+            await self.transport_app.handle_streamable_http(forwarded_scope, receive, send)
+        finally:
+            user_context_var.reset(token)
+            clear_trace_context()
+
+
+mcp_transport_app = _build_mcp_transport_app()
+internal_trusted_mcp_transport = InternalTrustedMCPTransportBridge(streamable_http_session)
+
+# Streamable http Mount
+app.mount("/mcp", app=mcp_transport_app.handle_streamable_http)
+app.mount("/_internal/mcp/transport", app=internal_trusted_mcp_transport.handle_streamable_http)
+
+# Conditional static files mounting and root redirect
+if UI_ENABLED:
+    # Mount static files for UI
+    logger.info("Mounting static files - UI enabled")
+    try:
+        # Create a sub-application for static files that will respect root_path
+        static_app = StaticFiles(directory=str(settings.static_dir))
+        STATIC_PATH = "/static"
+
+        app.mount(
+            STATIC_PATH,
+            static_app,
+            name="static",
+        )
+        logger.info("Static assets served from %s at %s", settings.static_dir, STATIC_PATH)
+    except RuntimeError as exc:
+        logger.warning(
+            "Static dir %s not found - Admin UI disabled (%s)",
+            settings.static_dir,
+            exc,
+        )
+
+    # Redirect root path to admin UI
+    @app.get("/")
+    async def root_redirect():
+        """
+        Redirects the root path ("/") to "/admin/".
+
+        Logs a debug message before redirecting.
+
+        Returns:
+            RedirectResponse: Redirects to /admin/.
+
+        Raises:
+            HTTPException: If there is an error during redirection.
+        """
+        logger.debug("Redirecting root path to /admin/")
+        root_path = settings.app_root_path
+        return RedirectResponse(f"{root_path}/admin/", status_code=303)
+        # return RedirectResponse(request.url_for("admin_home"))
+
+    # Redirect /favicon.ico to /static/favicon.ico for browser compatibility
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon_redirect() -> RedirectResponse:
+        """Redirect /favicon.ico to /static/favicon.ico for browser compatibility.
+
+        Returns:
+            RedirectResponse: 301 redirect to /static/favicon.ico.
+        """
+        root_path = settings.app_root_path
+        return RedirectResponse(f"{root_path}/static/favicon.ico", status_code=301)
+
+else:
+    # If UI is disabled, provide API info at root
+    logger.warning("Static files not mounted - UI disabled via MCPGATEWAY_UI_ENABLED=False")
+
+    @app.get("/")
+    async def root_info():
+        """
+        Returns basic API information at the root path.
+
+        Logs an info message indicating UI is disabled and provides details
+        about the app, including its name, version, and whether the UI and
+        admin API are enabled.
+
+        Returns:
+            dict: API info with app name, version, and UI/admin API status.
+        """
+        logger.info("UI disabled, serving API info at root path")
+        return {"name": settings.app_name, "description": f"{settings.app_name} API"}
+
+
+# Expose some endpoints at the root level as well
+app.post("/initialize")(initialize)
+app.post("/notifications")(handle_notification)

@@ -1,0 +1,77 @@
+.\.venv\Scripts\python.exe 
+: 2026-05-21T17:59:59 - 
+mcpgateway.config - INFO - 
+Using SQLite database. 
+Consider PostgreSQL for 
+production.
+At line:1 char:1
++ 
+.\.venv\Scripts\python.exe 
+fix_tool_urls.py 2>&1 | 
+Out-File -Encoding ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo         
+     : NotSpecified: (202  
+  6-05-21T17:5...for pro   
+ duction.:String) [], R    
+emoteException
+    + FullyQualifiedErrorI 
+   d : NativeCommandError
+ 
+2026-05-21T17:59:59 - 
+mcpgateway.config - 
+WARNING - \U0001f513 
+SECURITY WARNING: Default 
+BASIC_AUTH_PASSWORD 
+detected! Please change it 
+if you enable 
+API_ALLOW_BASIC_AUTH.
+2026-05-21T17:59:59 - 
+mcpgateway.config - 
+WARNING - \U0001f510 
+SECURITY WARNING: Admin 
+password has low 
+complexity. Should contain 
+at least 3 of: uppercase, 
+lowercase, digits, special 
+characters
+2026-05-21T17:59:59 - 
+mcpgateway.config - 
+WARNING - \U0001f513 
+SECURITY WARNING - 
+auth_encryption_secret: 
+Default/weak secret 
+detected! Please set a 
+strong, unique value for 
+production.
+2026-05-21T17:59:59 - 
+mcpgateway.config - 
+WARNING - \u26a0\ufe0f  
+SECURITY WARNING - 
+auth_encryption_secret: 
+Secret should be at least 
+32 characters long. 
+Current length: 12
+2026-05-21T17:59:59 - 
+mcpgateway.config - 
+WARNING - \U0001f511 
+SECURITY WARNING - 
+auth_encryption_secret: 
+Secret has low entropy. 
+Consider using a more 
+random value.
+2026-05-21T17:59:59 - 
+mcpgateway.config - INFO - 
+MCP_REQUIRE_AUTH not set; 
+defaulting to True to 
+match AUTH_REQUIRED=True.
+2026-05-21T17:59:59 - 
+mcpgateway.db - INFO - 
+Configuring SQLite with 
+pool_size=50, 
+max_overflow=10
+Fixed url for: external-api-post-lookup
+Fixed url for: utility-echo
+
+Tool URLs updated. Re-running test_scenarios.py to verify...

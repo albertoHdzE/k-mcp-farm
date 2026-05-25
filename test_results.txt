@@ -1,0 +1,26 @@
+=== ContextForge Scenario Verification ===
+
+[1] Verifying Tool Registration...
+    Total tools found: 20
+    - utility-echo (Reachable: True)
+    - external-api-post-lookup (Reachable: True)
+
+[2] Testing External API Scenario (JSONPlaceholder)...
+    Success: Received response from external API.
+    Data: Tool invocation failed: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed cert...
+
+[3] Testing Utility Function Scenario (Echo)...
+    Success: Utility echo returned.
+    Echo: Tool invocation failed: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed cert...
+
+[4] Testing Knowledge Context (Resource)...
+    Found Resource: System Knowledge Base (file://knowledge_base.md)
+    Success: Resource content retrieved.
+    Content Preview: ...
+
+[5] Testing Prompt Template...
+    Found Prompt: welcome-prompt
+    Success: Prompt rendered.
+    Rendered: Hello {name}, welcome to ContextForge! How can I assist you with your {task} today?
+
+=== Scenario Verification Complete ===

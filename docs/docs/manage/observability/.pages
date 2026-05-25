@@ -1,0 +1,8 @@
+title: Observability
+nav:
+  - index.md
+  - opentelemetry.md
+  - internal.md
+  - prometheus.md
+  - langfuse.md
+  - phoenix.md

@@ -1,0 +1,1512 @@
+# -*- coding: utf-8 -*-
+"""Location: ./mcpgateway/utils/verify_credentials.py
+Copyright 2025
+SPDX-License-Identifier: Apache-2.0
+Authors: Mihai Criveti
+
+Authentication verification utilities for ContextForge.
+This module provides JWT and Basic authentication verification functions
+for securing API endpoints. It supports authentication via Authorization
+headers and cookies.
+Examples:
+    >>> from mcpgateway.utils import verify_credentials as vc
+    >>> from mcpgateway.utils import jwt_config_helper as jch
+    >>> from pydantic import SecretStr
+    >>> class DummySettings:
+    ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+    ...     jwt_algorithm = 'HS256'
+    ...     jwt_audience = 'mcpgateway-api'
+    ...     jwt_issuer = 'mcpgateway'
+    ...     jwt_issuer_verification = True
+    ...     jwt_audience_verification = True
+    ...     jwt_public_key_path = ''
+    ...     jwt_private_key_path = ''
+    ...     basic_auth_user = 'user'
+    ...     basic_auth_password = SecretStr('pass')
+    ...     auth_required = True
+    ...     require_token_expiration = False
+    ...     require_jti = False
+    ...     validate_token_environment = False
+    ...     docs_allow_basic_auth = False
+    >>> vc.settings = DummySettings()
+    >>> jch.settings = DummySettings()
+    >>> jch.clear_jwt_caches()
+    >>> import jwt
+    >>> token = jwt.encode({'sub': 'alice', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'this-is-a-long-test-secret-key-32chars', algorithm='HS256')
+    >>> import asyncio
+    >>> asyncio.run(vc.verify_jwt_token(token))['sub'] == 'alice'
+    True
+    >>> payload = asyncio.run(vc.verify_credentials(token))
+    >>> payload['token'] == token
+    True
+    >>> from fastapi.security import HTTPBasicCredentials
+    >>> creds = HTTPBasicCredentials(username='user', password='pass')
+    >>> asyncio.run(vc.verify_basic_credentials(creds)) == 'user'
+    True
+    >>> creds_bad = HTTPBasicCredentials(username='user', password='wrong')
+    >>> try:
+    ...     asyncio.run(vc.verify_basic_credentials(creds_bad))
+    ... except Exception as e:
+    ...     print('error')
+    error
+"""
+
+# Standard
+import asyncio
+from base64 import b64decode
+import binascii
+from time import monotonic
+from typing import Any, Optional, Union
+from urllib.parse import urlsplit, urlunsplit
+
+# Third-Party
+from fastapi import Cookie, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
+from fastapi.security.utils import get_authorization_scheme_param
+import jwt
+
+# First-Party
+from mcpgateway.config import settings
+from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.utils.jwt_config_helper import validate_jwt_algo_and_keys
+from mcpgateway.utils.log_sanitizer import sanitize_for_log
+from mcpgateway.utils.paths import resolve_root_path
+from mcpgateway.utils.time_restrictions import validate_time_restrictions
+
+basic_security = HTTPBasic(auto_error=False)
+security = HTTPBearer(auto_error=False)
+
+# Initialize logging service first
+logging_service = LoggingService()
+logger = logging_service.get_logger(__name__)
+
+
+def is_proxy_auth_trust_active(settings_obj: Any | None = None) -> bool:
+    """Return whether proxy-header trust mode is explicitly active.
+
+    Args:
+        settings_obj: Optional settings object override (defaults to global settings).
+
+    Returns:
+        ``True`` when proxy-header trust is explicitly enabled and acknowledged;
+        otherwise ``False``.
+    """
+    current_settings = settings_obj or settings
+
+    if current_settings.mcp_client_auth_enabled or not current_settings.trust_proxy_auth:
+        return False
+
+    if getattr(current_settings, "trust_proxy_auth_dangerously", False) is True:
+        return True
+
+    if not getattr(is_proxy_auth_trust_active, "_warned", False):
+        logger.warning("Ignoring trusted proxy auth because TRUST_PROXY_AUTH_DANGEROUSLY is false while MCP client auth is disabled.")
+        is_proxy_auth_trust_active._warned = True  # type: ignore[attr-defined]
+    return False
+
+
+def extract_websocket_bearer_token(query_params: Any, headers: Any, *, query_param_warning: Optional[str] = None) -> Optional[str]:
+    """Extract bearer token from WebSocket Authorization headers.
+
+    Args:
+        query_params: WebSocket query parameters mapping-like object.
+        headers: WebSocket headers mapping-like object.
+        query_param_warning: Optional warning message when legacy query token is detected.
+
+    Returns:
+        Bearer token value when present, otherwise None.
+    """
+    # Do not accept tokens from query parameters. This avoids leaking bearer
+    # secrets through URL logs/history/proxy telemetry.
+    query = query_params or {}
+    legacy_token = query.get("token") if hasattr(query, "get") else None
+    if legacy_token and query_param_warning:
+        logger.warning(f"{query_param_warning}; token ignored")
+
+    header_values = headers or {}
+    auth_header = header_values.get("authorization") if hasattr(header_values, "get") else None
+    if not auth_header and hasattr(header_values, "get"):
+        auth_header = header_values.get("Authorization")
+    if auth_header:
+        scheme, _, credentials = auth_header.partition(" ")
+        if scheme.lower() == "bearer" and credentials:
+            return credentials.strip()
+    return None
+
+
+async def verify_jwt_token(token: str) -> dict:
+    """Verify and decode a JWT token in a single pass.
+
+    Decodes and validates a JWT token using the configured secret key
+    and algorithm from settings. Uses PyJWT's require option for claim
+    enforcement instead of a separate unverified decode.
+
+    Note:
+        With single-pass decoding, signature validation occurs before
+        claim validation. An invalid signature will result in "Invalid token"
+        error even if the token is also missing required claims.
+
+    Args:
+        token: The JWT token string to verify.
+
+    Returns:
+        dict: The decoded token payload containing claims (e.g., user info).
+
+    Raises:
+        HTTPException: If token is invalid, expired, or missing required claims.
+    """
+    try:
+        validate_jwt_algo_and_keys()
+
+        # Import the verification key helper
+        # First-Party
+        from mcpgateway.utils.jwt_config_helper import get_jwt_public_key_or_secret
+
+        options = {
+            "verify_aud": settings.jwt_audience_verification,
+            "verify_iss": settings.jwt_issuer_verification,
+        }
+
+        if settings.require_token_expiration:
+            options["require"] = ["exp"]
+
+        decode_kwargs = {
+            "key": get_jwt_public_key_or_secret(),
+            "algorithms": [settings.jwt_algorithm],
+            "options": options,
+        }
+
+        if settings.jwt_audience_verification:
+            decode_kwargs["audience"] = settings.jwt_audience
+
+        if settings.jwt_issuer_verification:
+            decode_kwargs["issuer"] = settings.jwt_issuer
+
+        payload = jwt.decode(token, **decode_kwargs)
+
+        # Log warning for tokens without expiration (when not required)
+        if not settings.require_token_expiration and "exp" not in payload:
+            logger.warning(f"JWT token without expiration accepted. Consider enabling REQUIRE_TOKEN_EXPIRATION for better security. Token sub: {payload.get('sub', 'unknown')}")
+
+        # Require JTI if configured
+        if settings.require_jti and "jti" not in payload:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token is missing required JTI claim. Set REQUIRE_JTI=false to allow.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Log warning for tokens without JTI (when not required)
+        if not settings.require_jti and "jti" not in payload:
+            logger.warning(f"JWT token without JTI accepted. Token cannot be revoked. Consider enabling REQUIRE_JTI for better security. Token sub: {payload.get('sub', 'unknown')}")
+
+        # Validate environment claim if configured (reject mismatched, allow missing for backward compatibility)
+        if settings.validate_token_environment:
+            token_env = payload.get("env")
+            if token_env is not None and token_env != settings.environment:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=f"Token environment mismatch: token is for '{token_env}', server is '{settings.environment}'",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+        # Validate time restrictions if present in token scopes
+        validate_time_restrictions(payload)
+
+        return payload
+
+    except jwt.MissingRequiredClaimError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is missing required expiration claim. Set REQUIRE_TOKEN_EXPIRATION=false to allow.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def verify_jwt_token_cached(token: str, request: Optional[Request] = None) -> dict:
+    """Verify JWT token with request-level caching.
+
+    If a request object is provided and the token has already been verified
+    for this request, returns the cached payload. Otherwise, performs
+    verification and caches the result in request.state.
+
+    Args:
+        token: JWT token string to verify
+        request: Optional FastAPI/Starlette request for request-level caching.
+            Must have a 'state' attribute to enable caching.
+
+    Returns:
+        dict: Decoded and verified JWT payload
+
+    Raises:
+        HTTPException: If token is invalid, expired, or missing required claims.
+    """
+    # Check request.state cache first (safely handle non-Request objects)
+    if request is not None and hasattr(request, "state"):
+        cached = getattr(request.state, "_jwt_verified_payload", None)
+        # Verify cache is a valid tuple of (token, payload) before unpacking
+        if cached is not None and isinstance(cached, tuple) and len(cached) == 2:
+            cached_token, cached_payload = cached
+            if cached_token == token:
+                return cached_payload
+
+    # Verify token (single decode)
+    payload = await verify_jwt_token(token)
+
+    # Cache in request.state for reuse across middleware
+    if request is not None and hasattr(request, "state"):
+        request.state._jwt_verified_payload = (token, payload)
+
+    return payload
+
+
+async def verify_credentials(token: str) -> dict:
+    """Verify credentials using a JWT token.
+
+    A wrapper around verify_jwt_token that adds the original token
+    to the decoded payload for reference.
+
+    This function uses verify_jwt_token internally which may raise exceptions.
+
+    Args:
+        token: The JWT token string to verify.
+
+    Returns:
+        dict: The validated token payload with the original token added
+            under the 'token' key.
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
+        >>> from pydantic import SecretStr
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
+        ...     basic_auth_user = 'user'
+        ...     basic_auth_password = SecretStr('pass')
+        ...     auth_required = True
+        ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
+        ...     docs_allow_basic_auth = False
+        >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
+        >>> jch.clear_jwt_caches()
+        >>> import jwt
+        >>> token = jwt.encode({'sub': 'alice', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'this-is-a-long-test-secret-key-32chars', algorithm='HS256')
+        >>> import asyncio
+        >>> payload = asyncio.run(vc.verify_credentials(token))
+        >>> payload['token'] == token
+        True
+    """
+    payload = await verify_jwt_token(token)
+    payload["token"] = token
+    return payload
+
+
+async def verify_credentials_cached(token: str, request: Optional[Request] = None) -> dict:
+    """Verify credentials using a JWT token with request-level caching.
+
+    A wrapper around verify_jwt_token_cached that adds the original token
+    to the decoded payload for reference.
+
+    Args:
+        token: The JWT token string to verify.
+        request: Optional FastAPI/Starlette request for request-level caching.
+
+    Returns:
+        dict: The validated token payload with the original token added
+            under the 'token' key. Returns a copy to avoid mutating cached payload.
+    """
+    payload = await verify_jwt_token_cached(token, request)
+    # Return a copy with token added to avoid mutating the cached payload
+    return {**payload, "token": token}
+
+
+def _raise_auth_401(detail: str) -> None:
+    """Raise a standardized bearer-auth 401 error.
+
+    Args:
+        detail: Error detail message for the response body.
+
+    Raises:
+        HTTPException: Always raises 401 Unauthorized with Bearer auth header.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def _enforce_revocation_and_active_user(payload: dict) -> None:
+    """Enforce token revocation and active-user checks for JWT-authenticated flows.
+
+    Args:
+        payload: Verified JWT payload used to derive revocation and user status checks.
+
+    Raises:
+        HTTPException: 401 when the token is revoked, the account is disabled,
+            or strict user-in-db mode rejects a missing user.
+    """
+    # First-Party
+    from mcpgateway.auth import _check_token_revoked_sync, _get_user_by_email_sync
+
+    jti = payload.get("jti")
+    if jti:
+        try:
+            if await asyncio.to_thread(_check_token_revoked_sync, jti):
+                _raise_auth_401("Token has been revoked")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Token revocation check failed for JTI %s: %s", jti, exc)
+
+    username = payload.get("sub") or payload.get("email") or payload.get("username")
+    if not username:
+        return
+
+    try:
+        user = await asyncio.to_thread(_get_user_by_email_sync, username)
+    except Exception as exc:
+        logger.warning("User status check failed for %s: %s", username, exc)
+        return
+
+    if user is None:
+        if settings.require_user_in_db and username != getattr(settings, "platform_admin_email", "admin@example.com"):
+            _raise_auth_401("User not found in database")
+        return
+
+    if not user.is_active:
+        _raise_auth_401("Account disabled")
+
+
+async def require_auth(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security), jwt_token: Optional[str] = Cookie(default=None)) -> str | dict:
+    """Require authentication via JWT token or proxy headers.
+
+    FastAPI dependency that checks for authentication via:
+    1. Proxy headers (if mcp_client_auth_enabled=false and trust_proxy_auth=true)
+    2. JWT token in Authorization header (Bearer scheme)
+    3. JWT token in cookies
+
+    If authentication is required but no token is provided, raises an HTTP 401 error.
+
+    Args:
+        request: The FastAPI request object for accessing headers.
+        credentials: HTTP Authorization credentials from the request header.
+        jwt_token: JWT token from cookies.
+
+    Returns:
+        str | dict: The verified credentials payload if authenticated,
+            proxy user if proxy auth enabled, or "anonymous" if authentication is not required.
+
+    Raises:
+        HTTPException: 401 status if authentication is required but no valid
+            token is provided.
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
+        >>> from pydantic import SecretStr
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
+        ...     basic_auth_user = 'user'
+        ...     basic_auth_password = SecretStr('pass')
+        ...     auth_required = True
+        ...     mcp_client_auth_enabled = True
+        ...     trust_proxy_auth = False
+        ...     proxy_user_header = 'X-Authenticated-User'
+        ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
+        ...     docs_allow_basic_auth = False
+        >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
+        >>> jch.clear_jwt_caches()
+        >>> import jwt
+        >>> from fastapi.security import HTTPAuthorizationCredentials
+        >>> from fastapi import Request
+        >>> import asyncio
+
+        Test with valid credentials in header:
+        >>> token = jwt.encode({'sub': 'alice', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'this-is-a-long-test-secret-key-32chars', algorithm='HS256')
+        >>> creds = HTTPAuthorizationCredentials(scheme='Bearer', credentials=token)
+        >>> req = Request(scope={'type': 'http', 'headers': []})
+        >>> result = asyncio.run(vc.require_auth(request=req, credentials=creds, jwt_token=None))
+        >>> result['sub'] == 'alice'
+        True
+
+        Test with valid token in cookie:
+        >>> result = asyncio.run(vc.require_auth(request=req, credentials=None, jwt_token=token))
+        >>> result['sub'] == 'alice'
+        True
+
+        Test with auth required but no token:
+        >>> try:
+        ...     asyncio.run(vc.require_auth(request=req, credentials=None, jwt_token=None))
+        ... except vc.HTTPException as e:
+        ...     print(e.status_code, e.detail)
+        401 Not authenticated
+
+        Test with auth not required:
+        >>> vc.settings.auth_required = False
+        >>> result = asyncio.run(vc.require_auth(request=req, credentials=None, jwt_token=None))
+        >>> result
+        'anonymous'
+        >>> vc.settings.auth_required = True
+    """
+    # If MCP client auth is disabled and proxy auth is trusted, use proxy headers
+    if not settings.mcp_client_auth_enabled:
+        if is_proxy_auth_trust_active():
+            # Extract user from proxy header
+            proxy_user = request.headers.get(settings.proxy_user_header)
+            if proxy_user:
+                return {"sub": proxy_user, "source": "proxy", "token": None}  # nosec B105 - None is not a password
+            # No proxy header - check auth_required (matches RBAC/WebSocket behavior)
+            if settings.auth_required:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Proxy authentication header required",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return "anonymous"
+        else:
+            # Warning: MCP auth disabled without proxy trust - security risk!
+            # This case is already warned about in config validation
+            if settings.auth_required:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required but no auth method configured",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return "anonymous"
+
+    # Standard JWT authentication flow - prioritize manual cookie reading
+    token = None
+
+    # 1. First try manual cookie reading (most reliable)
+    if hasattr(request, "cookies") and request.cookies:
+        manual_token = request.cookies.get("jwt_token")
+        if manual_token:
+            token = manual_token
+
+    # 2. Then try Authorization header
+    if not token and credentials and credentials.credentials:
+        token = credentials.credentials
+
+    # 3. Finally try FastAPI Cookie dependency (fallback)
+    if not token and jwt_token:
+        token = jwt_token
+
+    if settings.auth_required and not token:
+        _raise_auth_401("Not authenticated")
+
+    if not token:
+        return "anonymous"
+
+    payload = await verify_credentials_cached(token, request)
+    await _enforce_revocation_and_active_user(payload)
+    return payload
+
+
+async def verify_basic_credentials(credentials: HTTPBasicCredentials) -> str:
+    """Verify HTTP Basic authentication credentials.
+
+    Validates the provided username and password against the configured
+    basic auth credentials in settings.
+
+    Args:
+        credentials: HTTP Basic credentials containing username and password.
+
+    Returns:
+        str: The authenticated username if credentials are valid.
+
+    Raises:
+        HTTPException: 401 status if credentials are invalid.
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from pydantic import SecretStr
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     basic_auth_user = 'user'
+        ...     basic_auth_password = SecretStr('pass')
+        ...     auth_required = True
+        ...     docs_allow_basic_auth = False
+        >>> vc.settings = DummySettings()
+        >>> from fastapi.security import HTTPBasicCredentials
+        >>> creds = HTTPBasicCredentials(username='user', password='pass')
+        >>> import asyncio
+        >>> asyncio.run(vc.verify_basic_credentials(creds)) == 'user'
+        True
+        >>> creds_bad = HTTPBasicCredentials(username='user', password='wrong')
+        >>> try:
+        ...     asyncio.run(vc.verify_basic_credentials(creds_bad))
+        ... except Exception as e:
+        ...     print('error')
+        error
+    """
+    is_valid_user = credentials.username == settings.basic_auth_user
+    is_valid_pass = credentials.password == settings.basic_auth_password.get_secret_value()
+
+    if not (is_valid_user and is_valid_pass):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+async def require_basic_auth(credentials: HTTPBasicCredentials = Depends(basic_security)) -> str:
+    """Require valid HTTP Basic authentication.
+
+    FastAPI dependency that enforces Basic authentication when enabled.
+    Returns the authenticated username or "anonymous" if auth is not required.
+
+    Args:
+        credentials: HTTP Basic credentials provided by the client.
+
+    Returns:
+        str: The authenticated username or "anonymous" if auth is not required.
+
+    Raises:
+        HTTPException: 401 status if authentication is required but no valid
+            credentials are provided.
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from pydantic import SecretStr
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     basic_auth_user = 'user'
+        ...     basic_auth_password = SecretStr('pass')
+        ...     auth_required = True
+        ...     docs_allow_basic_auth = False
+        >>> vc.settings = DummySettings()
+        >>> from fastapi.security import HTTPBasicCredentials
+        >>> import asyncio
+
+        Test with valid credentials:
+        >>> creds = HTTPBasicCredentials(username='user', password='pass')
+        >>> asyncio.run(vc.require_basic_auth(creds))
+        'user'
+
+        Test with auth required but no credentials:
+        >>> try:
+        ...     asyncio.run(vc.require_basic_auth(None))
+        ... except vc.HTTPException as e:
+        ...     print(e.status_code, e.detail)
+        401 Not authenticated
+
+        Test with auth not required:
+        >>> vc.settings.auth_required = False
+        >>> asyncio.run(vc.require_basic_auth(None))
+        'anonymous'
+        >>> vc.settings.auth_required = True
+    """
+    if settings.auth_required:
+        if not credentials:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+        return await verify_basic_credentials(credentials)
+    return "anonymous"
+
+
+async def require_docs_basic_auth(auth_header: str) -> str:
+    """Dedicated handler for HTTP Basic Auth for documentation endpoints only.
+
+    This function is ONLY intended for /docs, /redoc, or similar endpoints, and is enabled
+    via the settings.docs_allow_basic_auth flag. It should NOT be used for general API authentication.
+
+    Args:
+        auth_header: Raw Authorization header value (e.g. "Basic username:password").
+
+    Returns:
+        str: The authenticated username if credentials are valid.
+
+    Raises:
+        HTTPException: If credentials are invalid or malformed.
+        ValueError: If the basic auth format is invalid (missing colon).
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from pydantic import SecretStr
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     basic_auth_user = 'user'
+        ...     basic_auth_password = SecretStr('pass')
+        ...     auth_required = True
+        ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
+        ...     docs_allow_basic_auth = True
+        >>> vc.settings = DummySettings()
+        >>> import base64, asyncio
+
+        Test with properly encoded credentials:
+        >>> userpass = base64.b64encode(b'user:pass').decode()
+        >>> auth_header = f'Basic {userpass}'
+        >>> asyncio.run(vc.require_docs_basic_auth(auth_header))
+        'user'
+
+        Test with different valid credentials:
+        >>> valid_creds = base64.b64encode(b'user:pass').decode()
+        >>> valid_header = f'Basic {valid_creds}'
+        >>> result = asyncio.run(vc.require_docs_basic_auth(valid_header))
+        >>> result == 'user'
+        True
+
+        Test with invalid password:
+        >>> badpass = base64.b64encode(b'user:wrong').decode()
+        >>> bad_header = f'Basic {badpass}'
+        >>> try:
+        ...     asyncio.run(vc.require_docs_basic_auth(bad_header))
+        ... except vc.HTTPException as e:
+        ...     e.status_code == 401
+        True
+
+        Test with malformed base64 (no colon):
+        >>> malformed = base64.b64encode(b'userpass').decode()
+        >>> malformed_header = f'Basic {malformed}'
+        >>> try:
+        ...     asyncio.run(vc.require_docs_basic_auth(malformed_header))
+        ... except vc.HTTPException as e:
+        ...     e.status_code == 401
+        True
+
+        Test with invalid base64 encoding:
+        >>> invalid_header = 'Basic invalid_base64!'
+        >>> try:
+        ...     asyncio.run(vc.require_docs_basic_auth(invalid_header))
+        ... except vc.HTTPException as e:
+        ...     'Invalid basic auth credentials' in e.detail
+        True
+
+        Test when docs_allow_basic_auth is disabled:
+        >>> vc.settings.docs_allow_basic_auth = False
+        >>> try:
+        ...     asyncio.run(vc.require_docs_basic_auth(auth_header))
+        ... except vc.HTTPException as e:
+        ...     'not allowed' in e.detail
+        True
+        >>> vc.settings.docs_allow_basic_auth = True
+
+        Test with non-Basic auth scheme:
+        >>> bearer_header = 'Bearer eyJhbGciOiJIUzI1NiJ9...'
+        >>> try:
+        ...     asyncio.run(vc.require_docs_basic_auth(bearer_header))
+        ... except vc.HTTPException as e:
+        ...     e.status_code == 401
+        True
+
+        Test with empty credentials part:
+        >>> empty_header = 'Basic '
+        >>> try:
+        ...     asyncio.run(vc.require_docs_basic_auth(empty_header))
+        ... except vc.HTTPException as e:
+        ...     'not allowed' in e.detail
+        True
+
+        Test with Unicode decode error:
+        >>> from base64 import b64encode
+        >>> bad_bytes = bytes([0xff, 0xfe])  # Invalid UTF-8 bytes
+        >>> bad_unicode = b64encode(bad_bytes).decode()
+        >>> unicode_header = f'Basic {bad_unicode}'
+        >>> try:
+        ...     asyncio.run(vc.require_docs_basic_auth(unicode_header))
+        ... except vc.HTTPException as e:
+        ...     'Invalid basic auth credentials' in e.detail
+        True
+    """
+    scheme, param = get_authorization_scheme_param(auth_header)
+    if scheme.lower() == "basic" and param and settings.docs_allow_basic_auth:
+        try:
+            data = b64decode(param).decode("ascii")
+            username, separator, password = data.partition(":")
+            if not separator:
+                raise ValueError("Invalid basic auth format")
+            credentials = HTTPBasicCredentials(username=username, password=password)
+            return await require_basic_auth(credentials=credentials)
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid basic auth credentials",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Basic authentication not allowed or malformed",
+        headers={"WWW-Authenticate": "Basic"},
+    )
+
+
+async def require_docs_auth_override(
+    auth_header: str | None = None,
+    jwt_token: str | None = None,
+) -> str | dict:
+    """Require authentication for docs endpoints, bypassing global auth settings.
+
+    This function specifically validates JWT tokens for documentation endpoints
+    (/docs, /redoc, /openapi.json) regardless of global authentication settings
+    like mcp_client_auth_enabled or auth_required.
+
+    Args:
+        auth_header: Raw Authorization header value (e.g. "Bearer eyJhbGciOi...").
+        jwt_token: JWT token from cookies.
+
+    Returns:
+        str | dict: The decoded JWT payload.
+
+    Raises:
+        HTTPException: If authentication fails or credentials are invalid.
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
+        ...     docs_allow_basic_auth = False
+        ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
+        >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
+        >>> jch.clear_jwt_caches()
+        >>> import jwt
+        >>> import asyncio
+
+        Test with valid JWT:
+        >>> token = jwt.encode({'sub': 'alice', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'this-is-a-long-test-secret-key-32chars', algorithm='HS256')
+        >>> auth_header = f'Bearer {token}'
+        >>> result = asyncio.run(vc.require_docs_auth_override(auth_header=auth_header))
+        >>> result['sub'] == 'alice'
+        True
+
+        Test with no token:
+        >>> try:
+        ...     asyncio.run(vc.require_docs_auth_override())
+        ... except vc.HTTPException as e:
+        ...     print(e.status_code, e.detail)
+        401 Not authenticated
+    """
+    # Extract token from header or cookie
+    token = jwt_token
+    if auth_header:
+        scheme, param = get_authorization_scheme_param(auth_header)
+        if scheme.lower() == "bearer" and param:
+            token = param
+        elif scheme.lower() == "basic" and param and settings.docs_allow_basic_auth:
+            # Only allow Basic Auth for docs endpoints when explicitly enabled
+            return await require_docs_basic_auth(auth_header)
+
+    # Always require a token for docs endpoints
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Validate JWT and enforce standard token/account status checks.
+    payload = await verify_credentials(token)
+    if isinstance(payload, dict):
+        await _enforce_revocation_and_active_user(payload)
+    return payload
+
+
+async def require_auth_override(
+    auth_header: str | None = None,
+    jwt_token: str | None = None,
+    request: Request | None = None,
+) -> str | dict:
+    """Call require_auth manually from middleware without FastAPI dependency injection.
+
+    This wrapper allows manual authentication verification in contexts where
+    FastAPI's dependency injection is not available (e.g., middleware).
+    It parses the Authorization header and creates the appropriate credentials
+    object before calling require_auth.
+
+    Args:
+        auth_header: Raw Authorization header value (e.g. "Bearer eyJhbGciOi...").
+        jwt_token: JWT taken from a cookie. If both header and cookie are
+            supplied, the header takes precedence.
+        request: Optional Request object for accessing headers (used for proxy auth).
+
+    Returns:
+        str | dict: The decoded JWT payload or the string "anonymous",
+            same as require_auth.
+
+    Raises:
+        HTTPException: If authentication fails or credentials are invalid.
+        ValueError: If basic auth credentials are malformed.
+
+    Note:
+        This wrapper may propagate HTTPException raised by require_auth,
+        but it does not raise anything on its own.
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
+        >>> from pydantic import SecretStr
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
+        ...     basic_auth_user = 'user'
+        ...     basic_auth_password = SecretStr('pass')
+        ...     auth_required = True
+        ...     mcp_client_auth_enabled = True
+        ...     trust_proxy_auth = False
+        ...     proxy_user_header = 'X-Authenticated-User'
+        ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
+        ...     docs_allow_basic_auth = False
+        >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
+        >>> jch.clear_jwt_caches()
+        >>> import jwt
+        >>> import asyncio
+
+        Test with Bearer token in auth header:
+        >>> token = jwt.encode({'sub': 'alice', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'this-is-a-long-test-secret-key-32chars', algorithm='HS256')
+        >>> auth_header = f'Bearer {token}'
+        >>> result = asyncio.run(vc.require_auth_override(auth_header=auth_header))
+        >>> result['sub'] == 'alice'
+        True
+
+        Test with invalid auth scheme:
+        >>> auth_header = 'Basic dXNlcjpwYXNz'  # Base64 encoded user:pass
+        >>> vc.settings.auth_required = False
+        >>> result = asyncio.run(vc.require_auth_override(auth_header=auth_header))
+        >>> result
+        'anonymous'
+
+        Test with only cookie token:
+        >>> result = asyncio.run(vc.require_auth_override(jwt_token=token))
+        >>> result['sub'] == 'alice'
+        True
+
+        Test with no auth:
+        >>> result = asyncio.run(vc.require_auth_override())
+        >>> result
+        'anonymous'
+        >>> vc.settings.auth_required = True
+    """
+    # Create a mock request if not provided (for backward compatibility)
+    if request is None:
+        request = Request(scope={"type": "http", "headers": []})
+
+    credentials = None
+    if auth_header:
+        scheme, param = get_authorization_scheme_param(auth_header)
+        if scheme.lower() == "bearer" and param:
+            credentials = HTTPAuthorizationCredentials(scheme=scheme, credentials=param)
+        elif scheme.lower() == "basic" and param and settings.docs_allow_basic_auth:
+            # Only allow Basic Auth for docs endpoints when explicitly enabled
+            return await require_docs_basic_auth(auth_header)
+    return await require_auth(request=request, credentials=credentials, jwt_token=jwt_token)
+
+
+async def require_auth_header_first(
+    auth_header: str | None = None,
+    jwt_token: str | None = None,
+    request: Request | None = None,
+) -> str | dict:
+    """Like require_auth_override but Authorization header takes precedence over cookies.
+
+    Token resolution order (matches streamable_http_auth middleware):
+    1. Authorization Bearer header (highest priority)
+    2. Cookie ``jwt_token`` from ``request.cookies``
+    3. ``jwt_token`` keyword argument
+
+    Use this in the stateful-session fallback (``_get_request_context_or_default``)
+    so that identity is consistent with the ASGI middleware that already
+    authenticated the primary request.
+
+    Args:
+        auth_header: Raw Authorization header value (e.g. "Bearer eyJhbGciOi...").
+        jwt_token: JWT taken from a cookie. Used only when no header token and no
+            request cookie are present.
+        request: Optional Request object.  A bare empty request is created when
+            *None* is supplied (backward-compatible default).
+
+    Returns:
+        str | dict: The decoded JWT payload or the string "anonymous".
+
+    Raises:
+        HTTPException: If authentication fails or credentials are invalid.
+
+    Examples:
+        >>> from mcpgateway.utils import verify_credentials as vc
+        >>> from mcpgateway.utils import jwt_config_helper as jch
+        >>> from pydantic import SecretStr
+        >>> class DummySettings:
+        ...     jwt_secret_key = 'this-is-a-long-test-secret-key-32chars'
+        ...     jwt_algorithm = 'HS256'
+        ...     jwt_audience = 'mcpgateway-api'
+        ...     jwt_issuer = 'mcpgateway'
+        ...     jwt_audience_verification = True
+        ...     jwt_issuer_verification = True
+        ...     jwt_public_key_path = ''
+        ...     jwt_private_key_path = ''
+        ...     basic_auth_user = 'user'
+        ...     basic_auth_password = SecretStr('pass')
+        ...     auth_required = True
+        ...     mcp_client_auth_enabled = True
+        ...     trust_proxy_auth = False
+        ...     proxy_user_header = 'X-Authenticated-User'
+        ...     require_token_expiration = False
+        ...     require_jti = False
+        ...     validate_token_environment = False
+        ...     docs_allow_basic_auth = False
+        >>> vc.settings = DummySettings()
+        >>> jch.settings = DummySettings()
+        >>> jch.clear_jwt_caches()
+        >>> import jwt
+        >>> import asyncio
+
+        Test header wins over cookie (the core fix):
+        >>> header_tok = jwt.encode({'sub': 'header-user', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'this-is-a-long-test-secret-key-32chars', algorithm='HS256')
+        >>> result = asyncio.run(vc.require_auth_header_first(auth_header=f'Bearer {header_tok}'))
+        >>> result['sub'] == 'header-user'
+        True
+
+        Test cookie fallback when no header:
+        >>> cookie_tok = jwt.encode({'sub': 'cookie-user', 'aud': 'mcpgateway-api', 'iss': 'mcpgateway'}, 'this-is-a-long-test-secret-key-32chars', algorithm='HS256')
+        >>> result = asyncio.run(vc.require_auth_header_first(jwt_token=cookie_tok))
+        >>> result['sub'] == 'cookie-user'
+        True
+
+        Test no auth when not required:
+        >>> vc.settings.auth_required = False
+        >>> result = asyncio.run(vc.require_auth_header_first())
+        >>> result
+        'anonymous'
+        >>> vc.settings.auth_required = True
+    """
+    if request is None:
+        request = Request(scope={"type": "http", "headers": []})
+
+    # Proxy auth path — identical to require_auth
+    if not settings.mcp_client_auth_enabled:
+        if is_proxy_auth_trust_active():
+            proxy_user = request.headers.get(settings.proxy_user_header)
+            if proxy_user:
+                return {"sub": proxy_user, "source": "proxy", "token": None}  # nosec B105 - None is not a password
+            if settings.auth_required:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Proxy authentication header required",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return "anonymous"
+        if settings.auth_required:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required but no auth method configured",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return "anonymous"
+
+    # Parse auth header once
+    scheme = param = ""
+    if auth_header:
+        scheme, param = get_authorization_scheme_param(auth_header)
+        if scheme.lower() == "basic" and param and settings.docs_allow_basic_auth:
+            return await require_docs_basic_auth(auth_header)
+
+    # Header-first JWT token resolution
+    token: str | None = None
+
+    # 1. Authorization Bearer header (highest priority — matches middleware)
+    if scheme.lower() == "bearer" and param:
+        token = param
+
+    # 2. Cookie from request.cookies
+    if not token and hasattr(request, "cookies") and request.cookies:
+        token = request.cookies.get("jwt_token") or None
+
+    # 3. jwt_token keyword argument
+    if not token and jwt_token:
+        token = jwt_token
+
+    if settings.auth_required and not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await verify_credentials_cached(token, request) if token else "anonymous"
+
+
+async def require_admin_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    jwt_token: Optional[str] = Cookie(None, alias="jwt_token"),
+    basic_credentials: Optional[HTTPBasicCredentials] = Depends(basic_security),
+) -> str:
+    """Require admin authentication supporting both email auth and basic auth.
+
+    This dependency supports multiple authentication methods:
+    1. Email-based JWT authentication (when EMAIL_AUTH_ENABLED=true)
+    2. Basic authentication (legacy support)
+    3. Proxy headers (if configured)
+
+    For email auth, the user must have is_admin=true.
+    For basic auth, uses the configured BASIC_AUTH_USER/PASSWORD.
+
+    Args:
+        request: FastAPI request object
+        credentials: HTTP Authorization credentials
+        jwt_token: JWT token from cookies
+        basic_credentials: HTTP Basic auth credentials
+
+    Returns:
+        str: Username/email of authenticated admin user
+
+    Raises:
+        HTTPException: 401 if authentication fails, 403 if user is not admin
+        RedirectResponse: Redirect to login page for browser requests
+
+    Examples:
+        >>> # This function is typically used as a FastAPI dependency
+        >>> callable(require_admin_auth)
+        True
+    """
+    # First-Party
+    from mcpgateway.config import settings
+
+    # Try email authentication first if enabled
+    if getattr(settings, "email_auth_enabled", False):
+        try:
+            # First-Party
+            from mcpgateway.db import get_db
+            from mcpgateway.services.email_auth_service import EmailAuthService
+
+            token = jwt_token
+            if not token and credentials:
+                token = credentials.credentials
+
+            if token:
+                db_session = next(get_db())
+                try:
+                    # Decode and verify JWT token (use cached version for performance)
+                    payload = await verify_jwt_token_cached(token, request)
+                    await _enforce_revocation_and_active_user(payload)
+                    username = payload.get("sub") or payload.get("username")  # Support both new and legacy formats
+
+                    if username:
+                        # Get user from database
+                        auth_service = EmailAuthService(db_session)
+                        current_user = await auth_service.get_user_by_email(username)
+
+                        if current_user and not getattr(current_user, "is_active", True):
+                            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account disabled")
+
+                        if current_user and current_user.is_admin:
+                            return current_user.email
+                        elif current_user:
+                            # User is authenticated but not admin - check if this is a browser request
+                            accept_header = request.headers.get("accept", "")
+                            if "text/html" in accept_header:
+                                # Redirect browser to login page with error
+                                root_path = resolve_root_path(request)
+                                raise HTTPException(status_code=status.HTTP_302_FOUND, detail="Admin privileges required", headers={"Location": f"{root_path}/admin/login?error=admin_required"})
+                            else:
+                                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+                        else:
+                            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+                except Exception:
+                    raise
+                finally:
+                    db_session.close()
+        except HTTPException as e:
+            # Re-raise HTTP exceptions (403, redirects, etc.)
+            if e.status_code != status.HTTP_401_UNAUTHORIZED:
+                raise
+            # For 401, check if we should redirect browser users
+            accept_header = request.headers.get("accept", "")
+            if "text/html" in accept_header:
+                root_path = resolve_root_path(request)
+                raise HTTPException(status_code=status.HTTP_302_FOUND, detail="Authentication required", headers={"Location": f"{root_path}/admin/login"})
+            # If JWT auth fails, fall back to basic auth for backward compatibility
+        except Exception:
+            # If there's any other error with email auth, fall back to basic auth
+            pass  # nosec B110 - Intentional fallback to basic auth on any email auth error
+
+    # Fall back to basic authentication (gated by API_ALLOW_BASIC_AUTH)
+    try:
+        if basic_credentials:
+            # SECURITY: Basic auth for API endpoints is disabled by default
+            if not settings.api_allow_basic_auth:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Basic authentication is disabled for API endpoints. Use JWT or API tokens instead.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return await verify_basic_credentials(basic_credentials)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except HTTPException:
+        # If both methods fail, check if we should redirect browser users to login page
+        if getattr(settings, "email_auth_enabled", False):
+            accept_header = request.headers.get("accept", "")
+            is_htmx = request.headers.get("hx-request") == "true"
+            if "text/html" in accept_header or is_htmx:
+                root_path = resolve_root_path(request)
+                raise HTTPException(status_code=status.HTTP_302_FOUND, detail="Authentication required", headers={"Location": f"{root_path}/admin/login"})
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required. Please login with email/password or use basic auth.", headers={"WWW-Authenticate": "Bearer"}
+                )
+        else:
+            # Re-raise the basic auth error
+            raise
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OAuth access token verification via JWKS (RFC 9728 — Virtual Server MCP auth)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Module-level caches for OIDC discovery and JWKS clients.
+# Same caching pattern used in sso_service.py for id_token verification.
+# A cached value of ``None`` is a negative result (discovery failure) cached
+# with a shorter TTL to avoid thrashing a misbehaving IdP.
+#
+# Negative caching distinguishes *transient* failures (network errors, 5xx,
+# request timeouts — the IdP may recover shortly) from *permanent* failures
+# (404, malformed JSON — the URL is simply wrong for this issuer). A short
+# transient TTL keeps IdP restarts from blackholing every virtual server
+# sharing that issuer for the longer permanent TTL.
+# Cache entry: (cached_at, metadata_or_None, ttl_seconds). The TTL is part
+# of the entry so we can distinguish transient from permanent negatives.
+_oauth_oidc_metadata_cache: dict[str, tuple[float, Optional[dict[str, Any]], float]] = {}
+_OAUTH_OIDC_METADATA_TTL = 300  # seconds — successful discovery
+_OAUTH_OIDC_METADATA_NEGATIVE_TTL_PERMANENT = 30  # seconds — 404/malformed
+_OAUTH_OIDC_METADATA_NEGATIVE_TTL_TRANSIENT = 5  # seconds — timeouts / 5xx / network
+_oauth_jwks_client_cache: dict[str, jwt.PyJWKClient] = {}
+
+
+def _build_metadata_urls(issuer: str) -> list[str]:
+    """Return the well-known metadata URLs to probe for ``issuer``.
+
+    Supports both RFC 8414 (OAuth Authorization Server Metadata) and OpenID
+    Connect Discovery 1.0. The two specs differ in where the well-known
+    segment is inserted relative to the issuer's path component:
+
+    * **RFC 8414**: the well-known segment is inserted between the host and
+      any path component — ``https://example.com/issuer1`` →
+      ``https://example.com/.well-known/oauth-authorization-server/issuer1``.
+    * **OIDC Discovery 1.0**: the well-known segment is *appended* to the
+      issuer path — ``https://example.com/issuer1`` →
+      ``https://example.com/issuer1/.well-known/openid-configuration``.
+
+    Both are tried in order; RFC 8414 comes first because ``authorization_servers``
+    in RFC 9728 is a generic OAuth issuer list and may point at servers that
+    do not publish an OIDC document at all.
+
+    For issuers with no path component, the two OIDC and OAuth URLs collapse
+    to ``{host}/.well-known/<segment>``.
+
+    Args:
+        issuer: The authorization server issuer URL.
+
+    Returns:
+        A list of candidate metadata URLs, in the order they should be tried.
+    """
+    parts = urlsplit(issuer.rstrip("/"))
+    issuer_path = parts.path  # "" or "/..."
+
+    oauth_path = "/.well-known/oauth-authorization-server"
+    if issuer_path:
+        oauth_path = f"{oauth_path}{issuer_path}"
+    oauth_url = urlunsplit((parts.scheme, parts.netloc, oauth_path, "", ""))
+
+    oidc_path = f"{issuer_path}/.well-known/openid-configuration"
+    oidc_url = urlunsplit((parts.scheme, parts.netloc, oidc_path, "", ""))
+
+    # When issuer has no path, both URLs differ only by the well-known
+    # segment; still probe both so a server that only publishes one form is
+    # discovered. ``dict.fromkeys`` preserves order while de-duplicating.
+    return list(dict.fromkeys([oauth_url, oidc_url]))
+
+
+async def _discover_oidc_metadata(issuer: str) -> Optional[dict[str, Any]]:
+    """Fetch and cache authorization-server metadata via RFC 8414 / OIDC discovery.
+
+    Tries both the RFC 8414 OAuth authorization server metadata endpoint
+    (``/.well-known/oauth-authorization-server``) and the OIDC discovery
+    endpoint (``/.well-known/openid-configuration``). Either one producing a
+    valid JSON metadata document is considered a success. Only when *both*
+    probes fail is the issuer negatively cached, so a non-OIDC OAuth server
+    is not permanently blocked by a single failing probe.
+
+    Successful responses are cached for ``_OAUTH_OIDC_METADATA_TTL`` seconds.
+    Failures (no probe returned metadata) are cached as ``None`` for
+    ``_OAUTH_OIDC_METADATA_NEGATIVE_TTL`` seconds so a misbehaving IdP cannot
+    amplify request volume on every inbound token.
+
+    Args:
+        issuer: Authorization server issuer URL.
+
+    Returns:
+        Provider metadata dict, or None on failure.
+    """
+    normalized = issuer.rstrip("/")
+    cached = _oauth_oidc_metadata_cache.get(normalized)
+    if cached is not None:
+        cached_at, metadata, ttl = cached
+        if monotonic() - cached_at < ttl:
+            return metadata
+        _oauth_oidc_metadata_cache.pop(normalized, None)
+
+    # First-Party
+    from mcpgateway.services.http_client_service import get_http_client  # pylint: disable=import-outside-toplevel
+
+    client = await get_http_client()
+    probe_errors: list[str] = []
+    saw_transient = False
+    for url in _build_metadata_urls(normalized):
+        try:
+            resp = await client.get(url, timeout=10)
+        except Exception as exc:
+            # Network errors (DNS, connection refused, TLS, timeout) are
+            # transient — the IdP may recover within seconds.
+            probe_errors.append(f"{url}: {type(exc).__name__}: {exc}")
+            logger.debug("OAuth metadata probe errored for %s: %s", url, exc)
+            saw_transient = True
+            continue
+
+        if resp.status_code != 200:
+            # 5xx is transient (server-side outage); 404 / other 4xx is
+            # permanent (URL is simply wrong for this issuer).
+            probe_errors.append(f"{url}: HTTP {resp.status_code}")
+            logger.debug("OAuth metadata probe returned %s for %s", resp.status_code, url)
+            if resp.status_code >= 500 or resp.status_code in {408, 429}:
+                saw_transient = True
+            continue
+
+        try:
+            metadata = resp.json()
+        except Exception as exc:
+            # Malformed JSON is permanent — fix the IdP config.
+            probe_errors.append(f"{url}: invalid JSON: {exc}")
+            logger.debug("OAuth metadata probe returned invalid JSON for %s: %s", url, exc)
+            continue
+
+        if not isinstance(metadata, dict):
+            probe_errors.append(f"{url}: metadata is not a JSON object")
+            continue
+
+        # RFC 8414 §3.3: verify the metadata ``issuer`` matches what we
+        # expected. A compromised CDN/proxy could serve metadata for a
+        # different issuer; caching it would let an attacker control the
+        # jwks_uri for a legitimate issuer.
+        metadata_issuer = metadata.get("issuer", "")
+        if isinstance(metadata_issuer, str) and metadata_issuer.rstrip("/") != normalized:
+            probe_errors.append(f"{url}: metadata issuer {metadata_issuer!r} does not match expected {normalized!r}")
+            logger.debug("Metadata issuer mismatch at %s: got %s, expected %s", url, metadata_issuer, normalized)
+            continue
+
+        _oauth_oidc_metadata_cache[normalized] = (monotonic(), metadata, _OAUTH_OIDC_METADATA_TTL)
+        return metadata
+
+    # All probes failed. Choose TTL based on whether any probe looked
+    # transient: if yes, cache for the short transient window so a brief
+    # IdP blip does not blackhole all virtual servers sharing this issuer
+    # for the permanent window.
+    ttl_on_failure = _OAUTH_OIDC_METADATA_NEGATIVE_TTL_TRANSIENT if saw_transient else _OAUTH_OIDC_METADATA_NEGATIVE_TTL_PERMANENT
+    logger.warning(
+        "Authorization server metadata discovery failed for %s (ttl=%ss, probes=%s)",
+        normalized,
+        ttl_on_failure,
+        probe_errors,
+    )
+    _oauth_oidc_metadata_cache[normalized] = (monotonic(), None, ttl_on_failure)
+    return None
+
+
+async def verify_oauth_access_token(
+    token: str,
+    authorization_servers: list[str],
+    *,
+    expected_audience: Optional[Union[str, list[str]]] = None,
+) -> Optional[dict[str, Any]]:
+    """Verify an OAuth access token issued by a configured authorization server.
+
+    Used for Virtual Server MCP endpoints with ``oauth_enabled=True``.
+    Validates the token issuer against the server's allowlist, discovers
+    the JWKS endpoint via RFC 8414 / OIDC metadata, and verifies the signature.
+    When ``expected_audience`` is provided, the token's ``aud`` claim is also
+    validated; a list value means any one of the supplied audiences is
+    accepted (PyJWT's native semantics).
+
+    Args:
+        token: Raw JWT Bearer token string.
+        authorization_servers: Allowed issuer URLs from ``server.oauth_config``.
+        expected_audience: Audience value(s) to validate against. Typically
+            the canonical MCP resource URL (RFC 8707/9728), optionally plus
+            the OAuth client_id for IdPs that populate ``aud`` that way.
+
+    Returns:
+        Verified claims dict on success, None on failure.
+    """
+    try:
+        unverified = jwt.decode(token, options={"verify_signature": False})
+    except jwt.DecodeError:
+        return None
+
+    token_issuer = unverified.get("iss")
+    if not token_issuer:
+        return None
+
+    # Validate issuer against allowlist (normalize trailing slashes)
+    normalized_issuer = token_issuer.rstrip("/")
+    normalized_allowed = {s.rstrip("/") for s in authorization_servers if isinstance(s, str)}
+    if normalized_issuer not in normalized_allowed:
+        logger.warning("OAuth token issuer %s not in allowlist %s", sanitize_for_log(normalized_issuer), normalized_allowed)
+        return None
+
+    # Discover OIDC metadata and resolve JWKS URI
+    metadata = await _discover_oidc_metadata(normalized_issuer)
+    if not metadata:
+        return None
+
+    jwks_uri = metadata.get("jwks_uri")
+    if not isinstance(jwks_uri, str) or not jwks_uri.strip():
+        logger.warning("No jwks_uri in OIDC metadata for issuer %s", sanitize_for_log(normalized_issuer))
+        return None
+
+    # Defense-in-depth: the jwks_uri from metadata must share the issuer's
+    # origin and use HTTPS. A compromised metadata endpoint could otherwise
+    # redirect key fetches to an attacker-controlled or internal host.
+    jwks_parts = urlsplit(jwks_uri.strip())
+    issuer_parts = urlsplit(normalized_issuer)
+    if jwks_parts.scheme != "https" or jwks_parts.netloc != issuer_parts.netloc:
+        logger.warning(
+            "jwks_uri %s does not match issuer origin %s; rejecting (SSRF defense)",
+            sanitize_for_log(jwks_uri),
+            sanitize_for_log(normalized_issuer),
+        )
+        return None
+
+    # Reject OIDC ID tokens before signature verification. ID tokens are
+    # front-channel credentials (authorization code / implicit flow) and
+    # must never be accepted as MCP bearer tokens. A matching ``aud`` alone
+    # is insufficient to distinguish them — an IdP configured with
+    # ``client_id`` in ``oauth_config`` would otherwise let a client replay
+    # an ID token it obtained via SSO.
+    #
+    # ``nonce`` and ``at_hash`` are defined only for ID tokens (OIDC Core
+    # §2); their presence on a bearer token is a reliable indicator from
+    # the IdPs that matter in practice (Keycloak, Auth0, Entra ID, Okta,
+    # Authentik all populate at least ``nonce`` on ID tokens for standard
+    # flows). The ``typ: at+jwt`` header (RFC 9068) is a positive access
+    # token marker but not required, so we do not key the decision on it —
+    # rejecting on its absence would break providers and PyJWT's default
+    # ``typ: JWT`` header which is used by many test/fake signers.
+    id_token_markers = [claim for claim in ("nonce", "at_hash") if claim in unverified]
+    if id_token_markers:
+        logger.warning(
+            "Rejecting OIDC ID token masquerading as OAuth access token (issuer=%s, claims=%s)",
+            sanitize_for_log(normalized_issuer),
+            id_token_markers,
+        )
+        return None
+
+    try:
+        jwks_uri = jwks_uri.strip()
+        if jwks_uri not in _oauth_jwks_client_cache:
+            _oauth_jwks_client_cache[jwks_uri] = jwt.PyJWKClient(jwks_uri)
+        jwks_client = _oauth_jwks_client_cache[jwks_uri]
+
+        signing_key = await asyncio.to_thread(jwks_client.get_signing_key_from_jwt, token)
+        decode_options = {"verify_signature": True, "verify_exp": True, "verify_iat": True, "verify_iss": False, "verify_aud": bool(expected_audience)}
+        decode_kwargs: dict[str, Any] = {
+            "key": signing_key.key,
+            "algorithms": ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512", "EdDSA"],
+            "options": decode_options,
+        }
+        if expected_audience:
+            decode_kwargs["audience"] = expected_audience
+        verified = await asyncio.to_thread(jwt.decode, token, **decode_kwargs)
+
+        # Re-verify the issuer in the *signed* payload against the issuer
+        # we resolved JWKS keys for (defense-in-depth). PyJWT's built-in
+        # ``verify_iss`` does not normalize trailing slashes, so we do it
+        # ourselves with the same normalization applied to the allowlist.
+        verified_iss = verified.get("iss", "")
+        if not isinstance(verified_iss, str) or verified_iss.rstrip("/") != normalized_issuer:
+            logger.warning(
+                "Verified token iss %s does not match expected issuer %s",
+                sanitize_for_log(str(verified_iss)),
+                sanitize_for_log(normalized_issuer),
+            )
+            return None
+
+        logger.debug("OAuth access token verified (issuer=%s, sub=%s)", sanitize_for_log(normalized_issuer), verified.get("sub", "unknown"))
+        return verified
+    except jwt.PyJWTError as exc:
+        logger.warning("OAuth access token verification failed (issuer=%s): %s", sanitize_for_log(normalized_issuer), exc)
+        return None

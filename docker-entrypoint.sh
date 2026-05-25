@@ -1,0 +1,709 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# s390x: Force protobuf to use pure-Python implementation.
+# The UPB C extension (google._upb._message) segfaults on s390x when
+# importing OpenTelemetry protobuf definitions.
+if [ "$(uname -m)" = "s390x" ]; then
+    export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+fi
+
+HTTP_SERVER="${HTTP_SERVER:-gunicorn}"
+APP_ROOT="${APP_ROOT:-/app}"
+RUST_MCP_MODE="${RUST_MCP_MODE:-off}"
+RUST_MCP_LOG="${RUST_MCP_LOG:-warn}"
+RUST_MCP_SESSION_AUTH_REUSE="${RUST_MCP_SESSION_AUTH_REUSE:-}"
+RUST_A2A_MODE="${RUST_A2A_MODE:-off}"
+RUST_A2A_LOG="${RUST_A2A_LOG:-warn}"
+EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED="${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED:-}"
+EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED="${EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED:-}"
+EXPERIMENTAL_RUST_MCP_RUNTIME_URL="${EXPERIMENTAL_RUST_MCP_RUNTIME_URL:-}"
+EXPERIMENTAL_RUST_MCP_RUNTIME_UDS="${EXPERIMENTAL_RUST_MCP_RUNTIME_UDS:-}"
+EXPERIMENTAL_RUST_MCP_SESSION_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_SESSION_CORE_ENABLED:-}"
+EXPERIMENTAL_RUST_MCP_EVENT_STORE_ENABLED="${EXPERIMENTAL_RUST_MCP_EVENT_STORE_ENABLED:-}"
+EXPERIMENTAL_RUST_MCP_RESUME_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_RESUME_CORE_ENABLED:-}"
+EXPERIMENTAL_RUST_MCP_LIVE_STREAM_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_LIVE_STREAM_CORE_ENABLED:-}"
+EXPERIMENTAL_RUST_MCP_AFFINITY_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_AFFINITY_CORE_ENABLED:-}"
+EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED="${EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED:-}"
+EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED="${EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED:-}"
+EXPERIMENTAL_RUST_A2A_RUNTIME_DELEGATE_ENABLED="${EXPERIMENTAL_RUST_A2A_RUNTIME_DELEGATE_ENABLED:-}"
+EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED="${EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED:-}"
+EXPERIMENTAL_RUST_A2A_RUNTIME_URL="${EXPERIMENTAL_RUST_A2A_RUNTIME_URL:-}"
+EXPERIMENTAL_RUST_A2A_RUNTIME_UDS="${EXPERIMENTAL_RUST_A2A_RUNTIME_UDS:-}"
+EXPERIMENTAL_RUST_A2A_RUNTIME_TIMEOUT_SECONDS="${EXPERIMENTAL_RUST_A2A_RUNTIME_TIMEOUT_SECONDS:-30}"
+CONTEXTFORGE_ENABLE_RUST_BUILD="${CONTEXTFORGE_ENABLE_RUST_BUILD:-false}"
+CONTEXTFORGE_ENABLE_RUST_MCP_RMCP_BUILD="${CONTEXTFORGE_ENABLE_RUST_MCP_RMCP_BUILD:-false}"
+MCP_RUST_LISTEN_HTTP="${MCP_RUST_LISTEN_HTTP:-}"
+MCP_RUST_LISTEN_UDS="${MCP_RUST_LISTEN_UDS:-}"
+MCP_RUST_PUBLIC_LISTEN_HTTP="${MCP_RUST_PUBLIC_LISTEN_HTTP:-}"
+MCP_RUST_LOG="${MCP_RUST_LOG:-}"
+MCP_RUST_USE_RMCP_UPSTREAM_CLIENT="${MCP_RUST_USE_RMCP_UPSTREAM_CLIENT:-}"
+MCP_RUST_SESSION_CORE_ENABLED="${MCP_RUST_SESSION_CORE_ENABLED:-}"
+MCP_RUST_EVENT_STORE_ENABLED="${MCP_RUST_EVENT_STORE_ENABLED:-}"
+MCP_RUST_RESUME_CORE_ENABLED="${MCP_RUST_RESUME_CORE_ENABLED:-}"
+MCP_RUST_LIVE_STREAM_CORE_ENABLED="${MCP_RUST_LIVE_STREAM_CORE_ENABLED:-}"
+MCP_RUST_AFFINITY_CORE_ENABLED="${MCP_RUST_AFFINITY_CORE_ENABLED:-}"
+MCP_RUST_SESSION_AUTH_REUSE_ENABLED="${MCP_RUST_SESSION_AUTH_REUSE_ENABLED:-}"
+MCP_RUST_SESSION_AUTH_REUSE_TTL_SECONDS="${MCP_RUST_SESSION_AUTH_REUSE_TTL_SECONDS:-}"
+A2A_RUST_LISTEN_HTTP="${A2A_RUST_LISTEN_HTTP:-}"
+A2A_RUST_LISTEN_UDS="${A2A_RUST_LISTEN_UDS:-}"
+A2A_RUST_LOG="${A2A_RUST_LOG:-}"
+A2A_RUST_REQUEST_TIMEOUT_MS="${A2A_RUST_REQUEST_TIMEOUT_MS:-}"
+A2A_RUST_AUTH_SECRET="${A2A_RUST_AUTH_SECRET:-${AUTH_ENCRYPTION_SECRET:-}}"
+A2A_RUST_BACKEND_BASE_URL="${A2A_RUST_BACKEND_BASE_URL:-}"
+A2A_RUST_MAX_CONCURRENT="${A2A_RUST_MAX_CONCURRENT:-}"
+A2A_RUST_MAX_QUEUED="${A2A_RUST_MAX_QUEUED:-}"
+A2A_RUST_CIRCUIT_FAILURE_THRESHOLD="${A2A_RUST_CIRCUIT_FAILURE_THRESHOLD:-}"
+A2A_RUST_CIRCUIT_COOLDOWN_SECS="${A2A_RUST_CIRCUIT_COOLDOWN_SECS:-}"
+A2A_RUST_REDIS_URL="${A2A_RUST_REDIS_URL:-${REDIS_URL:-}}"
+A2A_RUST_L2_CACHE_TTL_SECS="${A2A_RUST_L2_CACHE_TTL_SECS:-}"
+A2A_RUST_CACHE_INVALIDATION_CHANNEL="${A2A_RUST_CACHE_INVALIDATION_CHANNEL:-}"
+A2A_RUST_SESSION_ENABLED="${A2A_RUST_SESSION_ENABLED:-}"
+A2A_RUST_SESSION_TTL_SECS="${A2A_RUST_SESSION_TTL_SECS:-}"
+A2A_RUST_SESSION_FINGERPRINT_HEADERS="${A2A_RUST_SESSION_FINGERPRINT_HEADERS:-}"
+A2A_RUST_EVENT_STORE_MAX_EVENTS="${A2A_RUST_EVENT_STORE_MAX_EVENTS:-}"
+A2A_RUST_EVENT_STORE_TTL_SECS="${A2A_RUST_EVENT_STORE_TTL_SECS:-}"
+A2A_RUST_EVENT_FLUSH_INTERVAL_MS="${A2A_RUST_EVENT_FLUSH_INTERVAL_MS:-}"
+A2A_RUST_EVENT_FLUSH_BATCH_SIZE="${A2A_RUST_EVENT_FLUSH_BATCH_SIZE:-}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}" || {
+    echo "ERROR: Cannot change to script directory: ${SCRIPT_DIR}"
+    exit 1
+}
+
+RUST_MCP_PID=""
+RUST_A2A_PID=""
+SERVER_PID=""
+
+apply_rust_mcp_mode_defaults() {
+    local normalized_mode
+    normalized_mode="$(printf '%s' "${RUST_MCP_MODE}" | tr '[:upper:]' '[:lower:]')"
+    local runtime_enabled_default="false"
+    local managed_default="true"
+    local session_core_default="false"
+    local event_store_default="false"
+    local resume_core_default="false"
+    local live_stream_core_default="false"
+    local affinity_core_default="false"
+    local session_auth_reuse_default="false"
+
+    case "${normalized_mode}" in
+        ""|off)
+            ;;
+        shadow)
+            runtime_enabled_default="true"
+            ;;
+        edge)
+            runtime_enabled_default="true"
+            session_auth_reuse_default="true"
+            ;;
+        full)
+            runtime_enabled_default="true"
+            session_core_default="true"
+            event_store_default="true"
+            resume_core_default="true"
+            live_stream_core_default="true"
+            affinity_core_default="true"
+            session_auth_reuse_default="true"
+            ;;
+        *)
+            echo "ERROR: Unknown RUST_MCP_MODE value: ${RUST_MCP_MODE}"
+            echo "Valid options: off, shadow, edge, full"
+            exit 1
+            ;;
+    esac
+
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED="${runtime_enabled_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED}" ]]; then
+        EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED="${managed_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_RUNTIME_URL}" ]]; then
+        EXPERIMENTAL_RUST_MCP_RUNTIME_URL="http://127.0.0.1:8787"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_SESSION_CORE_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_MCP_SESSION_CORE_ENABLED="${session_core_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_EVENT_STORE_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_MCP_EVENT_STORE_ENABLED="${event_store_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_RESUME_CORE_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_MCP_RESUME_CORE_ENABLED="${resume_core_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_LIVE_STREAM_CORE_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_MCP_LIVE_STREAM_CORE_ENABLED="${live_stream_core_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_AFFINITY_CORE_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_MCP_AFFINITY_CORE_ENABLED="${affinity_core_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED}" ]]; then
+        if [[ -n "${RUST_MCP_SESSION_AUTH_REUSE}" ]]; then
+            EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED="${RUST_MCP_SESSION_AUTH_REUSE}"
+        else
+            EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED="${session_auth_reuse_default}"
+        fi
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_MCP_RUNTIME_UDS}" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED}" = "true" ]]; then
+        EXPERIMENTAL_RUST_MCP_RUNTIME_UDS="/tmp/contextforge-mcp-rust.sock"
+    fi
+    if [[ -z "${MCP_RUST_LISTEN_HTTP}" ]]; then
+        MCP_RUST_LISTEN_HTTP="127.0.0.1:8787"
+    fi
+    if [[ -z "${MCP_RUST_PUBLIC_LISTEN_HTTP}" \
+          && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" \
+          && "${EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED}" = "true" \
+          && "${EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED}" = "true" ]]; then
+        MCP_RUST_PUBLIC_LISTEN_HTTP="0.0.0.0:8787"
+    fi
+    if [[ -z "${MCP_RUST_LISTEN_UDS}" && -n "${EXPERIMENTAL_RUST_MCP_RUNTIME_UDS}" ]]; then
+        MCP_RUST_LISTEN_UDS="${EXPERIMENTAL_RUST_MCP_RUNTIME_UDS}"
+    fi
+    if [[ -z "${MCP_RUST_USE_RMCP_UPSTREAM_CLIENT}" ]]; then
+        if [[ "${CONTEXTFORGE_ENABLE_RUST_MCP_RMCP_BUILD}" = "true" ]]; then
+            MCP_RUST_USE_RMCP_UPSTREAM_CLIENT="true"
+        else
+            MCP_RUST_USE_RMCP_UPSTREAM_CLIENT="false"
+        fi
+    fi
+    if [[ -z "${MCP_RUST_LOG}" ]]; then
+        MCP_RUST_LOG="${RUST_MCP_LOG}"
+    fi
+    if [[ -z "${MCP_RUST_SESSION_CORE_ENABLED}" ]]; then
+        MCP_RUST_SESSION_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_SESSION_CORE_ENABLED}"
+    fi
+    if [[ -z "${MCP_RUST_EVENT_STORE_ENABLED}" ]]; then
+        MCP_RUST_EVENT_STORE_ENABLED="${EXPERIMENTAL_RUST_MCP_EVENT_STORE_ENABLED}"
+    fi
+    if [[ -z "${MCP_RUST_RESUME_CORE_ENABLED}" ]]; then
+        MCP_RUST_RESUME_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_RESUME_CORE_ENABLED}"
+    fi
+    if [[ -z "${MCP_RUST_LIVE_STREAM_CORE_ENABLED}" ]]; then
+        MCP_RUST_LIVE_STREAM_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_LIVE_STREAM_CORE_ENABLED}"
+    fi
+    if [[ -z "${MCP_RUST_AFFINITY_CORE_ENABLED}" ]]; then
+        MCP_RUST_AFFINITY_CORE_ENABLED="${EXPERIMENTAL_RUST_MCP_AFFINITY_CORE_ENABLED}"
+    fi
+    if [[ -z "${MCP_RUST_SESSION_AUTH_REUSE_ENABLED}" ]]; then
+        MCP_RUST_SESSION_AUTH_REUSE_ENABLED="${EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED}"
+    fi
+    if [[ -z "${MCP_RUST_SESSION_AUTH_REUSE_TTL_SECONDS}" ]]; then
+        MCP_RUST_SESSION_AUTH_REUSE_TTL_SECONDS="30"
+    fi
+
+    export RUST_MCP_MODE
+    export RUST_MCP_LOG
+    export RUST_MCP_SESSION_AUTH_REUSE
+    export EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED
+    export EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED
+    export EXPERIMENTAL_RUST_MCP_RUNTIME_URL
+    export EXPERIMENTAL_RUST_MCP_RUNTIME_UDS
+    export EXPERIMENTAL_RUST_MCP_SESSION_CORE_ENABLED
+    export EXPERIMENTAL_RUST_MCP_EVENT_STORE_ENABLED
+    export EXPERIMENTAL_RUST_MCP_RESUME_CORE_ENABLED
+    export EXPERIMENTAL_RUST_MCP_LIVE_STREAM_CORE_ENABLED
+    export EXPERIMENTAL_RUST_MCP_AFFINITY_CORE_ENABLED
+    export EXPERIMENTAL_RUST_MCP_SESSION_AUTH_REUSE_ENABLED
+    export MCP_RUST_LISTEN_HTTP
+    export MCP_RUST_LISTEN_UDS
+    export MCP_RUST_PUBLIC_LISTEN_HTTP
+    export MCP_RUST_LOG
+    export MCP_RUST_USE_RMCP_UPSTREAM_CLIENT
+    export MCP_RUST_SESSION_CORE_ENABLED
+    export MCP_RUST_EVENT_STORE_ENABLED
+    export MCP_RUST_RESUME_CORE_ENABLED
+    export MCP_RUST_LIVE_STREAM_CORE_ENABLED
+    export MCP_RUST_AFFINITY_CORE_ENABLED
+    export MCP_RUST_SESSION_AUTH_REUSE_ENABLED
+    export MCP_RUST_SESSION_AUTH_REUSE_TTL_SECONDS
+}
+
+apply_rust_a2a_mode_defaults() {
+    local normalized_mode="${RUST_A2A_MODE,,}"
+    local runtime_enabled_default="false"
+    local delegate_default="false"
+    local managed_default="true"
+
+    case "${normalized_mode}" in
+        ""|off)
+            ;;
+        shadow)
+            runtime_enabled_default="true"
+            ;;
+        edge|full)
+            runtime_enabled_default="true"
+            delegate_default="true"
+            ;;
+        *)
+            echo "ERROR: Unknown RUST_A2A_MODE value: ${RUST_A2A_MODE}"
+            echo "Valid options: off, shadow, edge, full"
+            exit 1
+            ;;
+    esac
+
+    if [[ -z "${EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED="${runtime_enabled_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_A2A_RUNTIME_DELEGATE_ENABLED}" ]]; then
+        EXPERIMENTAL_RUST_A2A_RUNTIME_DELEGATE_ENABLED="${delegate_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED}" ]]; then
+        EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED="${managed_default}"
+    fi
+    if [[ -z "${EXPERIMENTAL_RUST_A2A_RUNTIME_URL}" ]]; then
+        EXPERIMENTAL_RUST_A2A_RUNTIME_URL="http://127.0.0.1:8788"
+    fi
+    # Default to TCP — both compose nginx and the Helm chart's
+    # nginx upstream point at the sidecar via TCP (gateway:8788).
+    # UDS is opt-in: set EXPERIMENTAL_RUST_A2A_RUNTIME_UDS explicitly to
+    # bind a Unix socket instead.  Note: `listen_target()` in the runtime
+    # currently picks one or the other; an explicit UDS override will
+    # disable the TCP listener and break the nginx upstream until the
+    # nginx config is also updated to proxy via the same socket.
+    if [[ -z "${A2A_RUST_LISTEN_HTTP}" ]]; then
+        A2A_RUST_LISTEN_HTTP="127.0.0.1:8788"
+    fi
+    if [[ -z "${A2A_RUST_LISTEN_UDS}" && -n "${EXPERIMENTAL_RUST_A2A_RUNTIME_UDS}" ]]; then
+        A2A_RUST_LISTEN_UDS="${EXPERIMENTAL_RUST_A2A_RUNTIME_UDS}"
+    fi
+    if [[ -z "${A2A_RUST_LOG}" ]]; then
+        A2A_RUST_LOG="${RUST_A2A_LOG}"
+    fi
+
+    export RUST_A2A_MODE
+    export RUST_A2A_LOG
+    export EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED
+    export EXPERIMENTAL_RUST_A2A_RUNTIME_DELEGATE_ENABLED
+    export EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED
+    export EXPERIMENTAL_RUST_A2A_RUNTIME_URL
+    export EXPERIMENTAL_RUST_A2A_RUNTIME_UDS
+    export EXPERIMENTAL_RUST_A2A_RUNTIME_TIMEOUT_SECONDS
+    export A2A_RUST_LISTEN_HTTP
+    export A2A_RUST_LISTEN_UDS
+    export A2A_RUST_LOG
+    export A2A_RUST_REQUEST_TIMEOUT_MS
+    export A2A_RUST_AUTH_SECRET
+    export A2A_RUST_BACKEND_BASE_URL
+    export A2A_RUST_MAX_CONCURRENT
+    export A2A_RUST_MAX_QUEUED
+    export A2A_RUST_CIRCUIT_FAILURE_THRESHOLD
+    export A2A_RUST_CIRCUIT_COOLDOWN_SECS
+    export A2A_RUST_REDIS_URL
+    export A2A_RUST_L2_CACHE_TTL_SECS
+    export A2A_RUST_CACHE_INVALIDATION_CHANNEL
+    export A2A_RUST_SESSION_ENABLED
+    export A2A_RUST_SESSION_TTL_SECS
+    export A2A_RUST_SESSION_FINGERPRINT_HEADERS
+    export A2A_RUST_EVENT_STORE_MAX_EVENTS
+    export A2A_RUST_EVENT_STORE_TTL_SECS
+    export A2A_RUST_EVENT_FLUSH_INTERVAL_MS
+    export A2A_RUST_EVENT_FLUSH_BATCH_SIZE
+}
+
+cleanup() {
+    local pids=()
+
+    if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
+        pids+=("${SERVER_PID}")
+    fi
+    if [[ -n "${RUST_MCP_PID}" ]] && kill -0 "${RUST_MCP_PID}" 2>/dev/null; then
+        pids+=("${RUST_MCP_PID}")
+    fi
+    if [[ -n "${RUST_A2A_PID}" ]] && kill -0 "${RUST_A2A_PID}" 2>/dev/null; then
+        pids+=("${RUST_A2A_PID}")
+    fi
+
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        kill "${pids[@]}" 2>/dev/null || true
+        wait "${pids[@]}" 2>/dev/null || true
+    fi
+}
+
+print_mcp_runtime_mode() {
+    local runtime_mode="python"
+    local upstream_client_mode="native"
+    local session_core_mode="python"
+    local event_store_mode="python"
+    local resume_core_mode="python"
+    local live_stream_core_mode="python"
+    local affinity_core_mode="python"
+    local session_auth_reuse_mode="python"
+
+    if [[ "${MCP_RUST_USE_RMCP_UPSTREAM_CLIENT}" = "true" ]]; then
+        upstream_client_mode="rmcp"
+    fi
+    if [[ "${MCP_RUST_SESSION_CORE_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" ]]; then
+        session_core_mode="rust"
+    fi
+    if [[ "${MCP_RUST_EVENT_STORE_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" ]]; then
+        event_store_mode="rust"
+    fi
+    if [[ "${MCP_RUST_RESUME_CORE_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" ]]; then
+        resume_core_mode="rust"
+    fi
+    if [[ "${MCP_RUST_LIVE_STREAM_CORE_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" ]]; then
+        live_stream_core_mode="rust"
+    fi
+    if [[ "${MCP_RUST_AFFINITY_CORE_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" ]]; then
+        affinity_core_mode="rust"
+    fi
+    if [[ "${MCP_RUST_SESSION_AUTH_REUSE_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" ]]; then
+        session_auth_reuse_mode="rust"
+    fi
+
+    if [[ "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" ]]; then
+        if [[ "${EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED}" = "true" ]]; then
+            runtime_mode="rust-managed"
+            echo "MCP runtime mode: ${runtime_mode} (sidecar managed in this container, upstream client: ${upstream_client_mode}, session core: ${session_core_mode}, event store: ${event_store_mode}, resume core: ${resume_core_mode}, live stream core: ${live_stream_core_mode}, affinity core: ${affinity_core_mode}, session auth reuse: ${session_auth_reuse_mode})"
+        else
+            runtime_mode="rust-external"
+            echo "MCP runtime mode: ${runtime_mode} (external sidecar target: ${EXPERIMENTAL_RUST_MCP_RUNTIME_UDS:-${EXPERIMENTAL_RUST_MCP_RUNTIME_URL}}, upstream client: ${upstream_client_mode}, session core: ${session_core_mode}, event store: ${event_store_mode}, resume core: ${resume_core_mode}, live stream core: ${live_stream_core_mode}, affinity core: ${affinity_core_mode}, session auth reuse: ${session_auth_reuse_mode})"
+        fi
+
+        if [[ "${MCP_RUST_USE_RMCP_UPSTREAM_CLIENT}" = "true" && "${CONTEXTFORGE_ENABLE_RUST_MCP_RMCP_BUILD}" != "true" ]]; then
+            echo "ERROR: MCP_RUST_USE_RMCP_UPSTREAM_CLIENT=true but this image was built without rmcp support."
+            echo "Rebuild with RUST_MCP_BUILD=1 or --build-arg ENABLE_RUST_MCP_RMCP=true."
+            exit 1
+        fi
+        return
+    fi
+
+    if [[ "${CONTEXTFORGE_ENABLE_RUST_BUILD}" = "true" ]]; then
+        runtime_mode="python-rust-built-disabled"
+        echo "WARNING: MCP runtime mode: ${runtime_mode}"
+        echo "WARNING: Rust MCP artifacts are present in this image, but EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED=false so /mcp will run on the Python transport."
+        echo "WARNING: Set RUST_MCP_MODE=shadow, RUST_MCP_MODE=edge, or RUST_MCP_MODE=full to activate the Rust MCP runtime."
+        return
+    fi
+
+    echo "MCP runtime mode: ${runtime_mode} (Rust MCP artifacts not built into this image)"
+}
+
+print_a2a_runtime_mode() {
+    local runtime_mode="python"
+    local invoke_mode="python"
+
+    if [[ "${EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_A2A_RUNTIME_DELEGATE_ENABLED}" = "true" ]]; then
+        invoke_mode="rust"
+    fi
+
+    if [[ "${EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED}" = "true" ]]; then
+        if [[ "${EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED}" = "true" ]]; then
+            runtime_mode="rust-managed"
+            echo "A2A runtime mode: ${runtime_mode} (sidecar managed in this container, invoke path: ${invoke_mode})"
+        else
+            runtime_mode="rust-external"
+            echo "A2A runtime mode: ${runtime_mode} (external sidecar target: ${EXPERIMENTAL_RUST_A2A_RUNTIME_UDS:-${EXPERIMENTAL_RUST_A2A_RUNTIME_URL}}, invoke path: ${invoke_mode})"
+        fi
+        return
+    fi
+
+    if [[ "${CONTEXTFORGE_ENABLE_RUST_BUILD}" = "true" ]]; then
+        runtime_mode="python-rust-built-disabled"
+        echo "WARNING: A2A runtime mode: ${runtime_mode}"
+        echo "WARNING: Rust A2A artifacts are present in this image, but EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED=false so A2A invocations will stay on the Python client."
+        echo "WARNING: Set RUST_A2A_MODE=shadow, RUST_A2A_MODE=edge, or RUST_A2A_MODE=full to activate the Rust A2A runtime."
+        return
+    fi
+
+    echo "A2A runtime mode: ${runtime_mode} (Rust A2A artifacts not built into this image)"
+}
+
+build_server_command() {
+    case "${HTTP_SERVER}" in
+        granian)
+            echo "Starting ContextForge with Granian (Rust-based HTTP server)..."
+            SERVER_CMD=(./run-granian.sh "$@")
+            ;;
+        gunicorn)
+            echo "Starting ContextForge with Gunicorn + Uvicorn..."
+            SERVER_CMD=(./run-gunicorn.sh "$@")
+            ;;
+        *)
+            echo "ERROR: Unknown HTTP_SERVER value: ${HTTP_SERVER}"
+            echo "Valid options: granian, gunicorn"
+            exit 1
+            ;;
+    esac
+}
+
+start_managed_rust_mcp_runtime() {
+    local runtime_bin="/app/bin/contextforge-mcp-runtime"
+    local rust_listen_http="${MCP_RUST_LISTEN_HTTP:-127.0.0.1:8787}"
+    local rust_listen_uds="${MCP_RUST_LISTEN_UDS:-${EXPERIMENTAL_RUST_MCP_RUNTIME_UDS:-}}"
+    local app_root_path="${APP_ROOT_PATH:-}"
+    local backend_rpc_url="${MCP_RUST_BACKEND_RPC_URL:-http://127.0.0.1:${PORT:-4444}${app_root_path}/_internal/mcp/rpc}"
+    local rust_database_url="${MCP_RUST_DATABASE_URL:-}"
+    local rust_redis_url="${MCP_RUST_REDIS_URL:-${REDIS_URL:-}}"
+    local rust_cache_prefix="${MCP_RUST_CACHE_PREFIX:-${CACHE_PREFIX:-mcpgw:}}"
+    local rust_event_store_max="${MCP_RUST_EVENT_STORE_MAX_EVENTS_PER_STREAM:-${STREAMABLE_HTTP_MAX_EVENTS_PER_STREAM:-100}}"
+    local rust_event_store_ttl="${MCP_RUST_EVENT_STORE_TTL_SECONDS:-${STREAMABLE_HTTP_EVENT_TTL:-3600}}"
+
+    if [[ -z "${rust_database_url}" && -n "${DATABASE_URL:-}" ]]; then
+        case "${DATABASE_URL}" in
+            postgresql+psycopg://*)
+                rust_database_url="${DATABASE_URL/postgresql+psycopg:\/\//postgresql://}"
+                ;;
+            postgresql://*|postgres://*)
+                rust_database_url="${DATABASE_URL}"
+                ;;
+        esac
+    fi
+
+    if [[ "${CONTEXTFORGE_ENABLE_RUST_BUILD}" != "true" ]]; then
+        echo "ERROR: EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED=true but this image was built without Rust artifacts."
+        echo "Rebuild with RUST_MCP_BUILD=1 or --build-arg ENABLE_RUST=true, or set EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED=false to use an external sidecar."
+        exit 1
+    fi
+
+    if [[ ! -x "${runtime_bin}" ]]; then
+        echo "ERROR: Rust MCP runtime binary not found at ${runtime_bin}"
+        exit 1
+    fi
+
+    export MCP_RUST_LISTEN_HTTP="${rust_listen_http}"
+    if [[ -n "${rust_listen_uds}" ]]; then
+        export MCP_RUST_LISTEN_UDS="${rust_listen_uds}"
+    else
+        unset MCP_RUST_LISTEN_UDS || true
+        unset EXPERIMENTAL_RUST_MCP_RUNTIME_UDS || true
+    fi
+    if [[ -n "${MCP_RUST_PUBLIC_LISTEN_HTTP:-}" ]]; then
+        export MCP_RUST_PUBLIC_LISTEN_HTTP="${MCP_RUST_PUBLIC_LISTEN_HTTP}"
+    else
+        unset MCP_RUST_PUBLIC_LISTEN_HTTP || true
+    fi
+    export MCP_RUST_BACKEND_RPC_URL="${backend_rpc_url}"
+    export MCP_RUST_SESSION_CORE_ENABLED="${MCP_RUST_SESSION_CORE_ENABLED}"
+    export MCP_RUST_EVENT_STORE_ENABLED="${MCP_RUST_EVENT_STORE_ENABLED}"
+    export MCP_RUST_RESUME_CORE_ENABLED="${MCP_RUST_RESUME_CORE_ENABLED}"
+    export MCP_RUST_LIVE_STREAM_CORE_ENABLED="${MCP_RUST_LIVE_STREAM_CORE_ENABLED}"
+    export MCP_RUST_SESSION_AUTH_REUSE_ENABLED="${MCP_RUST_SESSION_AUTH_REUSE_ENABLED}"
+    export MCP_RUST_SESSION_AUTH_REUSE_TTL_SECONDS="${MCP_RUST_SESSION_AUTH_REUSE_TTL_SECONDS}"
+    export MCP_RUST_CACHE_PREFIX="${rust_cache_prefix}"
+    export MCP_RUST_EVENT_STORE_MAX_EVENTS_PER_STREAM="${rust_event_store_max}"
+    export MCP_RUST_EVENT_STORE_TTL_SECONDS="${rust_event_store_ttl}"
+    if [[ -n "${rust_database_url}" ]]; then
+        export MCP_RUST_DATABASE_URL="${rust_database_url}"
+    fi
+    if [[ -n "${rust_redis_url}" ]]; then
+        export MCP_RUST_REDIS_URL="${rust_redis_url}"
+    fi
+
+    if [[ -n "${rust_listen_uds}" ]]; then
+        echo "Starting experimental Rust MCP runtime on unix://${MCP_RUST_LISTEN_UDS} (backend: ${MCP_RUST_BACKEND_RPC_URL})..."
+    else
+        echo "Starting experimental Rust MCP runtime on ${MCP_RUST_LISTEN_HTTP} (backend: ${MCP_RUST_BACKEND_RPC_URL})..."
+    fi
+    "${runtime_bin}" &
+    RUST_MCP_PID=$!
+
+    python3 - <<'PY'
+import httpx
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+base_url = os.environ.get("EXPERIMENTAL_RUST_MCP_RUNTIME_URL", "http://127.0.0.1:8787").rstrip("/")
+health_url = f"{base_url}/health"
+uds_path = os.environ.get("EXPERIMENTAL_RUST_MCP_RUNTIME_UDS") or os.environ.get("MCP_RUST_LISTEN_UDS")
+
+for _ in range(60):
+    if uds_path:
+        try:
+            with httpx.Client(transport=httpx.HTTPTransport(uds=uds_path), timeout=2.0) as client:
+                response = client.get(health_url)
+                if response.status_code == 200:
+                    sys.exit(0)
+        except OSError:
+            time.sleep(0.5)
+        except httpx.HTTPError:
+            time.sleep(0.5)
+    else:
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as response:
+                if response.status == 200:
+                    sys.exit(0)
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.5)
+
+print(f"ERROR: Experimental Rust MCP runtime failed health check at {health_url}", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+install_plugin_requirements() {
+    RELOAD_PLUGIN_REQUIREMENTS_TXT="${RELOAD_PLUGIN_REQUIREMENTS_TXT:-false}"
+    PLUGIN_REQUIREMENTS_TXT_PATH="${PLUGIN_REQUIREMENTS_TXT_PATH:-${APP_ROOT}/plugins/requirements.txt}"
+
+    if [[ "${RELOAD_PLUGIN_REQUIREMENTS_TXT}" != "true" ]]; then
+        return 0
+    fi
+
+    # Resolve both APP_ROOT and the requested path to their canonical forms, then
+    # require the requested path to live inside APP_ROOT. Canonicalizing APP_ROOT too
+    # handles the case where /app is itself a symlink (uncommon in this repo's
+    # Containerfiles, but defensive). This prevents env-controlled path
+    # injection like PLUGIN_REQUIREMENTS_TXT_PATH=/tmp/evil-requirements.txt.
+    local app_root resolved_path
+    app_root="$(readlink -f "${APP_ROOT}" 2>/dev/null)"
+    if [[ -z "${app_root}" ]]; then
+        echo "❌ ${APP_ROOT} could not be resolved; refusing to start with RELOAD_PLUGIN_REQUIREMENTS_TXT=true"
+        return 1
+    fi
+    local requirements_dir requirements_file
+    requirements_dir="$(dirname "${PLUGIN_REQUIREMENTS_TXT_PATH}")"
+    requirements_file="$(basename "${PLUGIN_REQUIREMENTS_TXT_PATH}")"
+    if ! resolved_path="$(readlink -f "${requirements_dir}" 2>/dev/null)"; then
+        echo "❌ PLUGIN_REQUIREMENTS_TXT_PATH=${PLUGIN_REQUIREMENTS_TXT_PATH} could not be resolved; refusing to start"
+        return 1
+    fi
+    resolved_path="${resolved_path}/${requirements_file}"
+    if [[ "${resolved_path}" != "${app_root}/"* ]]; then
+        echo "❌ PLUGIN_REQUIREMENTS_TXT_PATH must resolve under ${app_root}/ (got ${resolved_path}); refusing to start"
+        return 1
+    fi
+    if [[ ! -f "${resolved_path}" ]]; then
+        echo "❌ Plugin requirements file ${resolved_path} not found; refusing to start with RELOAD_PLUGIN_REQUIREMENTS_TXT=true"
+        return 1
+    fi
+
+    local requirement_count
+    requirement_count="$(grep -cve '^\s*$' -e '^\s*#' "${resolved_path}" || true)"
+    echo "🧩 Installing ${requirement_count} plugin package requirement(s) from ${resolved_path}"
+
+    local max_retries=3
+    local retry_delay="${PLUGIN_REQUIREMENTS_RETRY_DELAY_SECONDS:-2}"
+    if [[ ! "${retry_delay}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "⚠️  PLUGIN_REQUIREMENTS_RETRY_DELAY_SECONDS=${retry_delay} is not a non-negative number; falling back to 2s"
+        retry_delay=2
+    fi
+    local attempt=1
+    while (( attempt <= max_retries )); do
+        if "${app_root}/.venv/bin/pip" install --no-cache-dir -r "${resolved_path}"; then
+            return 0
+        fi
+        echo "⚠️  Plugin package install attempt ${attempt}/${max_retries} failed"
+        (( attempt++ ))
+        (( attempt <= max_retries )) && sleep "${retry_delay}"
+    done
+    echo "❌ Plugin package install failed after ${max_retries} attempts; refusing to start with incomplete plugin dependencies"
+    return 1
+}
+
+start_managed_rust_a2a_runtime() {
+    local runtime_bin="/app/bin/contextforge-a2a-runtime"
+    local rust_listen_http="${A2A_RUST_LISTEN_HTTP:-127.0.0.1:8788}"
+    local rust_listen_uds="${A2A_RUST_LISTEN_UDS:-${EXPERIMENTAL_RUST_A2A_RUNTIME_UDS:-}}"
+
+    if [[ "${CONTEXTFORGE_ENABLE_RUST_BUILD}" != "true" ]]; then
+        echo "ERROR: EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED=true but this image was built without Rust artifacts."
+        echo "Rebuild with RUST_MCP_BUILD=1 or --build-arg ENABLE_RUST=true, or set EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED=false to use an external sidecar."
+        exit 1
+    fi
+
+    if [[ ! -x "${runtime_bin}" ]]; then
+        echo "ERROR: Rust A2A runtime binary not found at ${runtime_bin}"
+        exit 1
+    fi
+
+    export A2A_RUST_LISTEN_HTTP="${rust_listen_http}"
+    if [[ -n "${rust_listen_uds}" ]]; then
+        export A2A_RUST_LISTEN_UDS="${rust_listen_uds}"
+    else
+        unset A2A_RUST_LISTEN_UDS || true
+        unset EXPERIMENTAL_RUST_A2A_RUNTIME_UDS || true
+    fi
+    if [[ -z "${A2A_RUST_REQUEST_TIMEOUT_MS}" ]]; then
+        export A2A_RUST_REQUEST_TIMEOUT_MS="$(( EXPERIMENTAL_RUST_A2A_RUNTIME_TIMEOUT_SECONDS * 1000 ))"
+    fi
+    if [[ -n "${A2A_RUST_LOG:-}" ]]; then
+        export A2A_RUST_LOG="${A2A_RUST_LOG}"
+    fi
+
+    if [[ -n "${rust_listen_uds}" ]]; then
+        echo "Starting experimental Rust A2A runtime on unix://${A2A_RUST_LISTEN_UDS}..."
+    else
+        echo "Starting experimental Rust A2A runtime on ${A2A_RUST_LISTEN_HTTP}..."
+    fi
+    "${runtime_bin}" &
+    RUST_A2A_PID=$!
+
+    python3 - <<'PY'
+import httpx
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+base_url = os.environ.get("EXPERIMENTAL_RUST_A2A_RUNTIME_URL", "http://127.0.0.1:8788").rstrip("/")
+health_url = f"{base_url}/health"
+uds_path = os.environ.get("EXPERIMENTAL_RUST_A2A_RUNTIME_UDS") or os.environ.get("A2A_RUST_LISTEN_UDS")
+
+for _ in range(60):
+    if uds_path:
+        try:
+            with httpx.Client(transport=httpx.HTTPTransport(uds=uds_path), timeout=2.0) as client:
+                response = client.get(health_url)
+                if response.status_code == 200:
+                    sys.exit(0)
+        except OSError:
+            time.sleep(0.5)
+        except httpx.HTTPError:
+            time.sleep(0.5)
+    else:
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as response:
+                if response.status == 200:
+                    sys.exit(0)
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.5)
+
+print(f"ERROR: Experimental Rust A2A runtime failed health check at {health_url}", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+if [[ "${CONTEXTFORGE_TEST_ONLY_SOURCE:-false}" = "true" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+apply_rust_mcp_mode_defaults
+apply_rust_a2a_mode_defaults
+install_plugin_requirements
+build_server_command "$@"
+print_mcp_runtime_mode
+print_a2a_runtime_mode
+
+if [[ ( "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED}" = "true" ) || ( "${EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED}" = "true" ) ]]; then
+    trap cleanup EXIT INT TERM
+    if [[ "${EXPERIMENTAL_RUST_MCP_RUNTIME_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_MCP_RUNTIME_MANAGED}" = "true" ]]; then
+        start_managed_rust_mcp_runtime
+    fi
+    if [[ "${EXPERIMENTAL_RUST_A2A_RUNTIME_ENABLED}" = "true" && "${EXPERIMENTAL_RUST_A2A_RUNTIME_MANAGED}" = "true" ]]; then
+        start_managed_rust_a2a_runtime
+    fi
+    "${SERVER_CMD[@]}" &
+    SERVER_PID=$!
+
+    WAIT_PIDS=("${SERVER_PID}")
+    if [[ -n "${RUST_MCP_PID}" ]]; then
+        WAIT_PIDS+=("${RUST_MCP_PID}")
+    fi
+    if [[ -n "${RUST_A2A_PID}" ]]; then
+        WAIT_PIDS+=("${RUST_A2A_PID}")
+    fi
+
+    set +e
+    wait -n "${WAIT_PIDS[@]}"
+    STATUS=$?
+    set -e
+
+    exit "${STATUS}"
+fi
+
+exec "${SERVER_CMD[@]}"
